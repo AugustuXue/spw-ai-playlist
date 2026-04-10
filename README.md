@@ -4,6 +4,17 @@ SPW AI Playlist 是一款面向 [Salt Player for Windows](https://github.com/Mor
 
 当你在 SPW 主界面的搜索框中输入自然语言需求并按下回车后，它会自动读取曲库、调用远程大模型与向量接口，在本地曲库中检索出最符合语义的歌曲，并直接替换播放队列、开始播放。
 
+## 演示视频
+
+### 场景 1：语义理解与推荐
+<video src="assets/videos/showcase3.mp4" controls width="100%" type="video/mp4"></video>
+
+### 场景 2：基于情绪与氛围
+<video src="assets/videos/showcase2.mp4" controls width="100%" type="video/mp4"></video>
+
+### 场景 3：精确语义检索
+<video src="assets/videos/showcase1.mp4" controls width="100%" type="video/mp4"></video>
+
 - 开源地址：https://github.com/AugustuXue/spw-ai-playlist
 - 下载地址：https://github.com/AugustuXue/spw-ai-playlist/releases
 

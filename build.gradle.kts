@@ -51,6 +51,7 @@ tasks.named<Jar>("jar") {
             "Plugin-Description" to pluginDescription,
             "Plugin-Version" to pluginVersion,
             "Plugin-Provider" to pluginProvider,
+            "Plugin-Open-Source-Url" to "https://github.com/AugustuXue/spw-ai-playlist",
             "Plugin-Has-Config" to "true",
         )
     }

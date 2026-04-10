@@ -8,15 +8,18 @@ SPW AI Playlist 是一款面向 [Salt Player for Windows](https://github.com/Mor
 
 ### 场景 1：语义理解与推荐
 
-<video src="assets/videos/showcase3.mp4" controls type="video/mp4"></video>
+https://github.com/user-attachments/assets/14b50b4a-b6b0-46af-8428-59b279ce4e56
+
 
 ### 场景 2：基于情绪与氛围
 
-<video src="assets/videos/showcase2.mp4" controls type="video/mp4"></video>
+https://github.com/user-attachments/assets/9c883992-9dad-4e77-bc98-d203b9fd0c84
 
 ### 场景 3：精确语义检索
 
-<video src="https://github.com/AugustuXue/spw-ai-playlist/raw/main/assets/videos/showcase1.mp4" width="100%" controls="controls" type="video/mp4"></video>
+https://github.com/user-attachments/assets/0a49b46e-198d-425a-80c4-7182a1714ba7
+
+
 
 - 开源地址：https://github.com/AugustuXue/spw-ai-playlist
 - 下载地址：https://github.com/AugustuXue/spw-ai-playlist/releases

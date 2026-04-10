@@ -1,0 +1,105 @@
+{
+  "configs": [
+    {
+      "title": "向量模型 (Embedding) 设置",
+      "config": "config.json",
+      "preferences": [
+        {
+          "key": "remote_ai.embedding_api_key",
+          "type": "edittext",
+          "title": "API 密钥 (API Key)",
+          "summary": "用于请求文本向量 API 接口的鉴权密钥。",
+          "default_value": ""
+        },
+        {
+          "key": "remote_ai.embedding_model",
+          "type": "edittext",
+          "title": "模型名称 (Model ID)",
+          "summary": "服务商提供的模型标识符 (例如: Qwen/Qwen3-Embedding-8B)。",
+          "default_value": "Qwen/Qwen3-Embedding-8B"
+        },
+        {
+          "key": "remote_ai.embedding_base_url",
+          "type": "edittext",
+          "title": "请求接口 (Endpoint)",
+          "summary": "获取文本向量的 HTTP 完整接口地址 (需包含 /v1/embeddings 等路径)。",
+          "default_value": "https://api.siliconflow.cn/v1/embeddings"
+        }
+      ]
+    },
+    {
+      "title": "大语言模型 (LLM) 设置",
+      "config": "config.json",
+      "preferences": [
+        {
+          "key": "remote_ai.chat_api_key",
+          "type": "edittext",
+          "title": "API 密钥 (API Key)",
+          "summary": "用于请求聊天补全 API 接口的鉴权密钥。",
+          "default_value": ""
+        },
+        {
+          "key": "remote_ai.chat_model",
+          "type": "edittext",
+          "title": "模型名称 (Model ID)",
+          "summary": "服务商提供的模型标识符 (例如: deepseek/deepseek-v3.2-251201)。",
+          "default_value": "deepseek/deepseek-v3.2-251201"
+        },
+        {
+          "key": "remote_ai.chat_base_url",
+          "type": "edittext",
+          "title": "请求接口 (Endpoint)",
+          "summary": "大语言模型聊天的 HTTP 完整接口地址 (需包含 /v1/chat/completions 等路径)。",
+          "default_value": "https://api.qnaigc.com/v1/chat/completions"
+        }
+      ]
+    },
+    {
+      "title": "RAG 检索与处理设置",
+      "config": "config.json",
+      "preferences": [
+        {
+          "key": "rag.thread_count",
+          "type": "edittext",
+          "title": "处理线程数",
+          "summary": "并发请求 API 的线程数量 (默认: 1)。如果您的 API 允许高并发，可以适当调大。",
+          "default_value": "1"
+        },
+        {
+          "key": "rag.max_playback_items",
+          "type": "edittext",
+          "title": "最大播放列表歌曲数",
+          "summary": "每次搜索后，最多添加多少首相似歌曲到播放队列 (默认: 20)。",
+          "default_value": "20"
+        },
+        {
+          "key": "rag.request_delay_ms",
+          "type": "edittext",
+          "title": "请求延迟 (毫秒)",
+          "summary": "两次 API 请求之间的延迟时间，用于避免触发频率限制被封号 (默认: 1000)。",
+          "default_value": "1000"
+        },
+        {
+          "key": "rag.enable_query_expansion",
+          "type": "switch",
+          "title": "启用查询扩展",
+          "summary": "开启后会先使用大语言模型扩展搜索词，再生成向量。会增加一次 LLM 请求，因此延迟和成本更高。",
+          "default_value": false
+        }
+      ]
+    },
+    {
+      "title": "日志与排障设置",
+      "config": "config.json",
+      "preferences": [
+        {
+          "key": "debug.enable_file_log",
+          "type": "switch",
+          "title": "开启文件日志",
+          "summary": "开启后会将调试日志写入插件数据目录下的 logs/plugin-debug.log；关闭后不写入文件日志。",
+          "default_value": false
+        }
+      ]
+    }
+  ]
+}

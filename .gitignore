@@ -1,0 +1,7 @@
+# 忽略 Claude 配置文件
+.claude/
+
+# 忽略构建输出目录
+build/
+
+.gradle/

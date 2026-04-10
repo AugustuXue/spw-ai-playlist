@@ -16,7 +16,7 @@ SPW AI Playlist 是一款面向 [Salt Player for Windows](https://github.com/Mor
 
 ### 场景 3：精确语义检索
 
-<video src="assets/videos/showcase1.mp4" controls type="video/mp4"></video>
+<video src="./assets/videos/showcase1.mp4" width="100%" controls="controls"></video>
 
 - 开源地址：https://github.com/AugustuXue/spw-ai-playlist
 - 下载地址：https://github.com/AugustuXue/spw-ai-playlist/releases

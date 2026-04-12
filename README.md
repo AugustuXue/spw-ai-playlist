@@ -268,7 +268,6 @@ https://github.com/user-attachments/assets/0a49b46e-198d-425a-80c4-7182a1714ba7
 - 搜索任务会取消前一次未完成的请求，避免并发重复触发
 - 对 API 限流错误做提示与降级
 
-## 配置项说明
 
 ### `remote_ai.embedding_api_key`
 Embedding 接口鉴权密钥。

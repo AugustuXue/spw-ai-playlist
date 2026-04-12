@@ -17,8 +17,10 @@ import java.awt.event.KeyEvent
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
+import java.io.FileInputStream
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.security.MessageDigest
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.LinkedBlockingQueue
@@ -166,12 +168,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
      * resolved lazily on first use and stored in the same @Volatile fields.
      */
     private fun initReflection() {
-        // AppDatabase singleton field
+        // AppDatabase class handle only; the actual singleton is resolved dynamically at runtime.
         try {
-            val cls = Class.forName("com.xuncorp.voxzen.data.AppDatabase")
-            rfAppDbInstanceField = cls.getDeclaredField("\u0780").also { it.isAccessible = true }
-            logDebug("initReflection(): AppDatabase instance field cached")
-        } catch (t: Throwable) { logThrowable("initReflection(): AppDatabase field", t) }
+            Class.forName("com.xuncorp.voxzen.data.AppDatabase")
+            logDebug("initReflection(): AppDatabase class loaded")
+        } catch (t: Throwable) { logThrowable("initReflection(): AppDatabase class", t) }
 
         // PiscesMediaItem 6-arg constructor
         try {
@@ -472,21 +473,17 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     @Suppress("UNCHECKED_CAST")
     private suspend fun loadTracksFromDao(): List<Any>? {
         return try {
-            val instanceField = rfAppDbInstanceField ?: run {
-                logDebug("loadTracksFromDao(): AppDatabase instance field not cached")
-                return null
-            }
-            val db = instanceField.get(null) ?: run {
-                logDebug("loadTracksFromDao(): AppDatabase singleton is null")
+            val db = resolveAppDatabaseInstance() ?: run {
+                logDebug("loadTracksFromDao(): AppDatabase instance not available")
                 return null
             }
             logDebug("loadTracksFromDao(): db instance class=${db.javaClass.name}")
 
-            val trackDaoMethod = rfTrackDaoMethod ?: findMethod(db.javaClass, "\u037F", 0)?.also {
+            val trackDaoMethod = rfTrackDaoMethod ?: resolveTrackDaoMethod(db)?.also {
                 rfTrackDaoMethod = it
                 logDebug("loadTracksFromDao(): trackDao method cached from ${db.javaClass.name}")
             } ?: run {
-                logDebug("loadTracksFromDao(): trackDao method not found")
+                logDebug("loadTracksFromDao(): trackDao method not found; db=${db.javaClass.name}")
                 return null
             }
             val trackDao = trackDaoMethod.invoke(db) ?: run {
@@ -495,7 +492,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             }
             logDebug("loadTracksFromDao(): trackDao class=${trackDao.javaClass.name}")
 
-            val getAllFlowMethod = rfGetAllFlowMethod ?: findMethod(trackDao.javaClass, "\u0528", 0)?.also {
+            val getAllFlowMethod = rfGetAllFlowMethod ?: resolveTrackListFlowMethod(trackDao)?.also {
                 rfGetAllFlowMethod = it
                 logDebug("loadTracksFromDao(): getAllFlow method cached from ${trackDao.javaClass.name}")
             } ?: run {
@@ -566,13 +563,31 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         return try {
             val trackId = trackValue(track, "getId")?.toString()?.takeIf { it.isNotBlank() }
                 ?: throw IllegalStateException("Track id missing")
-            if (checkExisting && embeddingDb.getById(trackId) != null) {
-                logDebug("seedFirstTrack(): skipped existing trackId=$trackId")
-                return SeedResult.SKIPPED
-            }
             val title = trackValue(track, "getTitle")?.toString().orEmpty()
             val artist = trackValue(track, "getArtist")?.toString().orEmpty()
             val album = trackValue(track, "getAlbum")?.toString().orEmpty()
+            val contentHash = buildTrackContentHash(track)
+            val existingById = embeddingDb.getById(trackId)
+            if (existingById != null) {
+                logDebug("seedFirstTrack(): skipped existing trackId=$trackId")
+                return SeedResult.SKIPPED
+            }
+            val existingByHash = if (contentHash.isNotBlank()) embeddingDb.getByHash(contentHash) else null
+            if (existingByHash != null) {
+                embeddingDb.rekey(existingByHash.trackId, trackId, contentHash, title, artist, album)
+                logDebug("seedFirstTrack(): rekeyed by hash oldTrackId=${existingByHash.trackId} newTrackId=$trackId")
+                return SeedResult.SKIPPED
+            }
+            val existingByMetadata = embeddingDb.getByMetadata(title, artist, album)
+            if (existingByMetadata != null) {
+                if (contentHash.isNotBlank() && existingByMetadata.contentHash.isBlank()) {
+                    embeddingDb.rekey(existingByMetadata.trackId, trackId, contentHash, title, artist, album)
+                    logDebug("seedFirstTrack(): rekeyed by metadata oldTrackId=${existingByMetadata.trackId} newTrackId=$trackId")
+                    return SeedResult.SKIPPED
+                }
+                logDebug("seedFirstTrack(): skipped existing metadata title='$title' artist='$artist' album='$album'")
+                return SeedResult.SKIPPED
+            }
             val sourceText = buildTrackSourceText(track)
             logDebug("seedFirstTrack(): trackId=$trackId sourceTextLength=${sourceText.length}")
 
@@ -581,7 +596,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
 
             val embeddingInput = buildEmbeddingInput(sourceText, description)
             val vector = remoteAi.createEmbedding(embeddingInput)
-            embeddingDb.upsert(trackId, embeddingInput, vector, title, artist, album)
+            embeddingDb.upsert(trackId, embeddingInput, vector, contentHash, title, artist, album)
             logDebug("seedFirstTrack(): upserted trackId=$trackId vectorSize=${vector.size}")
             SeedResult.SUCCESS
         } catch (t: Throwable) {
@@ -614,6 +629,30 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             }
         }.trimEnd()
     }
+
+    private fun buildTrackContentHash(track: Any): String {
+        val path = trackValue(track, "getPath")?.toString().orEmpty()
+        if (path.isBlank()) return ""
+        val normalizedPath = fileUriToOsPath(path)
+        return try {
+            val file = File(normalizedPath)
+            if (!file.isFile) return ""
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (t: Throwable) {
+            logThrowable("buildTrackContentHash(): failure for path='$normalizedPath'", t)
+            ""
+        }
+    }
+
 
     /**
      * Combines the raw track metadata text with the AI-generated description
@@ -788,13 +827,34 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     private fun trackValue(track: Any, getterName: String): Any? {
         return try {
             val method = when (getterName) {
-                "getId"         -> rfTrackGetId         ?: track.javaClass.getMethod(getterName).also { rfTrackGetId = it }
-                "getTitle"      -> rfTrackGetTitle      ?: track.javaClass.getMethod(getterName).also { rfTrackGetTitle = it }
-                "getArtist"     -> rfTrackGetArtist     ?: track.javaClass.getMethod(getterName).also { rfTrackGetArtist = it }
-                "getAlbum"      -> rfTrackGetAlbum      ?: track.javaClass.getMethod(getterName).also { rfTrackGetAlbum = it }
-                "getAlbumArtist"-> rfTrackGetAlbumArtist?: track.javaClass.getMethod(getterName).also { rfTrackGetAlbumArtist = it }
-                "getYear"       -> rfTrackGetYear       ?: track.javaClass.getMethod(getterName).also { rfTrackGetYear = it }
-                "getPath"       -> rfTrackGetPath       ?: track.javaClass.getMethod(getterName).also { rfTrackGetPath = it }
+                "getId"         -> rfTrackGetId         ?: track.javaClass.getMethod(getterName).also {
+                    rfTrackGetId = it
+                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
+                }
+                "getTitle"      -> rfTrackGetTitle      ?: track.javaClass.getMethod(getterName).also {
+                    rfTrackGetTitle = it
+                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
+                }
+                "getArtist"     -> rfTrackGetArtist     ?: track.javaClass.getMethod(getterName).also {
+                    rfTrackGetArtist = it
+                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
+                }
+                "getAlbum"      -> rfTrackGetAlbum      ?: track.javaClass.getMethod(getterName).also {
+                    rfTrackGetAlbum = it
+                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
+                }
+                "getAlbumArtist"-> rfTrackGetAlbumArtist?: track.javaClass.getMethod(getterName).also {
+                    rfTrackGetAlbumArtist = it
+                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
+                }
+                "getYear"       -> rfTrackGetYear       ?: track.javaClass.getMethod(getterName).also {
+                    rfTrackGetYear = it
+                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
+                }
+                "getPath"       -> rfTrackGetPath       ?: track.javaClass.getMethod(getterName).also {
+                    rfTrackGetPath = it
+                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
+                }
                 else            -> track.javaClass.getMethod(getterName)
             }
             method.invoke(track)
@@ -836,7 +896,9 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         val cached = getCache()
         if (cached != null) {
             return try {
-                cached.get(obj)
+                val value = cached.get(obj)
+                logDebug("cachedGetField(): $label cache hit in ${cached.declaringClass.name}, valueClass=${value?.javaClass?.name}")
+                value
             } catch (t: Throwable) {
                 logThrowable("cachedGetField(): $label get failed", t)
                 null
@@ -884,6 +946,142 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         }
         logDebug("getField(): $label not found from ${obj.javaClass.name}")
         return null
+    }
+
+    private fun resolveAppDatabaseInstance(): Any? {
+        val appDbClass = runCatching {
+            Class.forName("com.xuncorp.voxzen.data.AppDatabase")
+        }.getOrElse { t ->
+            logThrowable("resolveAppDatabaseInstance(): load AppDatabase class failed", t)
+            return null
+        }
+
+        runCatching {
+            val field = appDbClass.getDeclaredField("ށ").apply { isAccessible = true }
+            val value = field.get(null)
+            logDebug("resolveAppDatabaseInstance(): direct field ${field.name} -> ${value?.javaClass?.name}")
+            if (value != null) return value
+        }.onFailure { t ->
+            logThrowable("resolveAppDatabaseInstance(): direct field ށ failed", t)
+        }
+
+        logDeclaredMethods(appDbClass, "resolveAppDatabaseInstance(): AppDatabase class")
+
+        for (field in appDbClass.declaredFields) {
+            runCatching {
+                field.isAccessible = true
+                val value = field.get(null)
+                logDebug("resolveAppDatabaseInstance(): field ${field.name} type=${field.type.name} -> ${value?.javaClass?.name}")
+
+                if (value == null) return@runCatching
+
+                val valueClass = value.javaClass
+                if (valueClass.name == "com.xuncorp.voxzen.data.AppDatabase" || valueClass.superclass?.name == "com.xuncorp.voxzen.data.AppDatabase" || valueClass.name.endsWith("AppDatabase_Impl")) {
+                    logDebug("resolveAppDatabaseInstance(): matched database instance from field ${field.name}")
+                    return value
+                }
+
+                val holderGetter = valueClass.declaredMethods.firstOrNull {
+                    it.parameterCount == 0 && it.returnType.name == "com.xuncorp.voxzen.data.AppDatabase"
+                }
+                if (holderGetter != null) {
+                    logDeclaredMethods(valueClass, "resolveAppDatabaseInstance(): holder ${valueClass.name}")
+                    holderGetter.isAccessible = true
+                    val db = holderGetter.invoke(value)
+                    logDebug("resolveAppDatabaseInstance(): ${valueClass.name}.${holderGetter.name}() -> ${db?.javaClass?.name}")
+                    if (db != null) return db
+                }
+            }.onFailure { t ->
+                logThrowable("resolveAppDatabaseInstance(): field ${field.name} read failed", t)
+            }
+        }
+
+        logDebug("resolveAppDatabaseInstance(): no database instance found")
+        return null
+    }
+
+    private fun resolveTrackDaoMethod(db: Any): java.lang.reflect.Method? {
+        val clazz = db.javaClass
+        logDebug(
+            "resolveTrackDaoMethod(): scanning ${clazz.name}, super=${clazz.superclass?.name}, interfaces=${clazz.interfaces.joinToString { it.name }}"
+        )
+
+        runCatching {
+            clazz.getDeclaredMethod("Ϳ").apply { isAccessible = true }
+        }.onSuccess { method ->
+            logDebug("resolveTrackDaoMethod(): direct hit ${clazz.name}.${method.name}/0 -> ${method.returnType.name}")
+            return method
+        }.onFailure { t ->
+            logThrowable("resolveTrackDaoMethod(): direct method Ϳ failed on ${clazz.name}", t)
+        }
+
+        var c: Class<*>? = clazz
+        while (c != null) {
+            c.declaredMethods.forEach { method ->
+                if (method.parameterCount == 0) {
+                    logDebug(
+                        "resolveTrackDaoMethod(): candidate ${c.name}.${method.name}/0 -> ${method.returnType.name}"
+                    )
+                }
+                if (method.parameterCount == 0 && method.name == "Ϳ") {
+                    method.isAccessible = true
+                    logDebug("resolveTrackDaoMethod(): matched ${c.name}.${method.name}/0")
+                    return method
+                }
+            }
+            c = c.superclass
+        }
+        logDebug("resolveTrackDaoMethod(): no zero-arg method Ϳ found on ${clazz.name}")
+        return null
+    }
+
+    private fun resolveTrackListFlowMethod(trackDao: Any): java.lang.reflect.Method? {
+        val clazz = trackDao.javaClass
+        logDebug(
+            "resolveTrackListFlowMethod(): scanning ${clazz.name}, super=${clazz.superclass?.name}, interfaces=${clazz.interfaces.joinToString { it.name }}"
+        )
+
+        runCatching {
+            clazz.getDeclaredMethod("Ԩ").apply { isAccessible = true }
+        }.onSuccess { method ->
+            logDebug("resolveTrackListFlowMethod(): direct hit ${clazz.name}.${method.name}/0 -> ${method.returnType.name}")
+            return method
+        }.onFailure { t ->
+            logThrowable("resolveTrackListFlowMethod(): direct method Ԩ failed on ${clazz.name}", t)
+        }
+
+        var c: Class<*>? = clazz
+        while (c != null) {
+            c.declaredMethods.forEach { method ->
+                if (method.parameterCount == 0) {
+                    logDebug(
+                        "resolveTrackListFlowMethod(): candidate ${c.name}.${method.name}/0 -> ${method.returnType.name}"
+                    )
+                }
+                if (method.parameterCount == 0 && method.name == "Ԩ") {
+                    method.isAccessible = true
+                    logDebug("resolveTrackListFlowMethod(): matched ${c.name}.${method.name}/0")
+                    return method
+                }
+            }
+            c = c.superclass
+        }
+        logDebug("resolveTrackListFlowMethod(): no zero-arg method Ԩ found on ${clazz.name}")
+        return null
+    }
+
+    private fun logDeclaredMethods(clazz: Class<*>, label: String) {
+        try {
+            val methods = clazz.declaredMethods
+            logDebug("$label: declaredMethods=${methods.size}")
+            methods.forEach { method ->
+                logDebug(
+                    "$label: method ${method.name}/${method.parameterCount} -> ${method.returnType.name} params=${method.parameterTypes.joinToString { it.name }}"
+                )
+            }
+        } catch (t: Throwable) {
+            logThrowable("$label: failed to enumerate declared methods", t)
+        }
     }
 
     private fun findMethod(clazz: Class<*>, name: String, paramCount: Int): java.lang.reflect.Method? {

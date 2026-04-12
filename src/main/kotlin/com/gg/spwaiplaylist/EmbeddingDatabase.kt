@@ -28,6 +28,7 @@ class EmbeddingDatabase(private val dataDir: File) {
                 source_text TEXT NOT NULL,
                 vector      BLOB NOT NULL,
                 updated_at  INTEGER NOT NULL,
+                content_hash TEXT,
                 title       TEXT DEFAULT '',
                 artist      TEXT DEFAULT '',
                 album       TEXT DEFAULT ''
@@ -35,20 +36,38 @@ class EmbeddingDatabase(private val dataDir: File) {
         """
 
         private const val INSERT_SQL = """
-            INSERT OR REPLACE INTO songs_embedding (track_id, source_text, vector, updated_at, title, artist, album)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO songs_embedding (track_id, source_text, vector, updated_at, content_hash, title, artist, album)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         private const val SELECT_BY_ID_SQL = """
-            SELECT track_id, source_text, vector, updated_at FROM songs_embedding WHERE track_id = ?
+            SELECT track_id, source_text, vector, updated_at, content_hash, title, artist, album
+            FROM songs_embedding WHERE track_id = ?
+        """
+
+        private const val SELECT_BY_HASH_SQL = """
+            SELECT track_id, source_text, vector, updated_at, content_hash, title, artist, album
+            FROM songs_embedding WHERE content_hash = ?
+        """
+
+        private const val SELECT_BY_METADATA_SQL = """
+            SELECT track_id, source_text, vector, updated_at, content_hash, title, artist, album
+            FROM songs_embedding WHERE title = ? AND artist = ? AND album = ?
         """
 
         private const val SELECT_LIMIT_SQL = """
-            SELECT track_id, source_text, vector, updated_at FROM songs_embedding ORDER BY updated_at DESC LIMIT ?
+            SELECT track_id, source_text, vector, updated_at, content_hash, title, artist, album
+            FROM songs_embedding ORDER BY updated_at DESC LIMIT ?
         """
 
         private const val DELETE_SQL = """
             DELETE FROM songs_embedding WHERE track_id = ?
+        """
+
+        private const val REKEY_SQL = """
+            UPDATE songs_embedding
+            SET track_id = ?, content_hash = ?, title = ?, artist = ?, album = ?
+            WHERE track_id = ?
         """
 
         private const val COUNT_SQL = """
@@ -89,7 +108,7 @@ class EmbeddingDatabase(private val dataDir: File) {
                 while (rs.next()) existingColumns.add(rs.getString("name"))
             }
         }
-        listOf("title", "artist", "album").forEach { col ->
+        listOf("content_hash", "title", "artist", "album").forEach { col ->
             if (col !in existingColumns) {
                 conn.createStatement().use { it.execute("ALTER TABLE songs_embedding ADD COLUMN $col TEXT DEFAULT ''") }
             }
@@ -114,6 +133,7 @@ class EmbeddingDatabase(private val dataDir: File) {
         trackId: String,
         sourceText: String,
         vector: FloatArray,
+        contentHash: String = "",
         title: String = "",
         artist: String = "",
         album: String = "",
@@ -124,9 +144,10 @@ class EmbeddingDatabase(private val dataDir: File) {
             stmt.setString(2, sourceText)
             stmt.setBytes(3, floatArrayToBytes(vector))
             stmt.setLong(4, updatedAt)
-            stmt.setString(5, title)
-            stmt.setString(6, artist)
-            stmt.setString(7, album)
+            stmt.setString(5, contentHash)
+            stmt.setString(6, title)
+            stmt.setString(7, artist)
+            stmt.setString(8, album)
             stmt.executeUpdate()
         } ?: throw SQLException("Database not open")
     }
@@ -140,16 +161,64 @@ class EmbeddingDatabase(private val dataDir: File) {
             stmt.setString(1, trackId)
             stmt.executeQuery().use { rs ->
                 if (rs.next()) {
-                    return SongRecord(
-                        trackId = rs.getString("track_id"),
-                        sourceText = rs.getString("source_text"),
-                        vector = bytesToFloatArray(rs.getBytes("vector")),
-                        updatedAt = rs.getLong("updated_at")
-                    )
+                    return readSongRecord(rs)
                 }
             }
         }
         return null
+    }
+
+    /**
+     * Retrieves a single record by content hash.
+     */
+    @Throws(SQLException::class)
+    fun getByHash(contentHash: String): SongRecord? {
+        if (contentHash.isBlank()) return null
+        connection?.prepareStatement(SELECT_BY_HASH_SQL)?.use { stmt ->
+            stmt.setString(1, contentHash)
+            stmt.executeQuery().use { rs ->
+                if (rs.next()) {
+                    return readSongRecord(rs)
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Retrieves a single record by title, artist, and album.
+     */
+    @Throws(SQLException::class)
+    fun getByMetadata(title: String, artist: String, album: String): SongRecord? {
+        if (title.isBlank() || artist.isBlank() || album.isBlank()) return null
+        connection?.prepareStatement(SELECT_BY_METADATA_SQL)?.use { stmt ->
+            stmt.setString(1, title)
+            stmt.setString(2, artist)
+            stmt.setString(3, album)
+            stmt.executeQuery().use { rs ->
+                if (rs.next()) {
+                    return readSongRecord(rs)
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Updates the track ID and content hash for an existing record.
+     */
+    @Throws(SQLException::class)
+    @Synchronized
+    fun rekey(existingTrackId: String, newTrackId: String, contentHash: String, title: String, artist: String, album: String) {
+        connection?.prepareStatement(REKEY_SQL)?.use { stmt ->
+            stmt.setString(1, newTrackId)
+            stmt.setString(2, contentHash)
+            stmt.setString(3, title)
+            stmt.setString(4, artist)
+            stmt.setString(5, album)
+            stmt.setString(6, existingTrackId)
+            stmt.executeUpdate()
+        } ?: throw SQLException("Database not open")
     }
 
     /**
@@ -173,12 +242,7 @@ class EmbeddingDatabase(private val dataDir: File) {
             stmt.setInt(1, limit)
             stmt.executeQuery().use { rs ->
                 while (rs.next()) {
-                    result += SongRecord(
-                        trackId = rs.getString("track_id"),
-                        sourceText = rs.getString("source_text"),
-                        vector = bytesToFloatArray(rs.getBytes("vector")),
-                        updatedAt = rs.getLong("updated_at")
-                    )
+                    result += readSongRecord(rs)
                 }
             }
         }
@@ -262,15 +326,10 @@ class EmbeddingDatabase(private val dataDir: File) {
     @Throws(SQLException::class)
     fun getAllRecords(): List<SongRecord> {
         val result = mutableListOf<SongRecord>()
-        connection?.prepareStatement("SELECT track_id, source_text, vector, updated_at FROM songs_embedding")?.use { stmt ->
+        connection?.prepareStatement("SELECT track_id, source_text, vector, updated_at, content_hash, title, artist, album FROM songs_embedding")?.use { stmt ->
             stmt.executeQuery().use { rs ->
                 while (rs.next()) {
-                    result += SongRecord(
-                        trackId = rs.getString("track_id"),
-                        sourceText = rs.getString("source_text"),
-                        vector = bytesToFloatArray(rs.getBytes("vector")),
-                        updatedAt = rs.getLong("updated_at")
-                    )
+                    result += readSongRecord(rs)
                 }
             }
         }
@@ -301,6 +360,20 @@ class EmbeddingDatabase(private val dataDir: File) {
     fun getTrackIdsWithEmptyMetadata(): Set<String> {
         val result = mutableSetOf<String>()
         connection?.prepareStatement("SELECT track_id FROM songs_embedding WHERE artist = '' OR artist IS NULL")?.use { stmt ->
+            stmt.executeQuery().use { rs ->
+                while (rs.next()) result.add(rs.getString("track_id"))
+            }
+        }
+        return result
+    }
+
+    /**
+     * Returns track IDs whose content hash is empty.
+     */
+    @Throws(SQLException::class)
+    fun getTrackIdsWithEmptyHash(): Set<String> {
+        val result = mutableSetOf<String>()
+        connection?.prepareStatement("SELECT track_id FROM songs_embedding WHERE content_hash = '' OR content_hash IS NULL")?.use { stmt ->
             stmt.executeQuery().use { rs ->
                 while (rs.next()) result.add(rs.getString("track_id"))
             }
@@ -344,6 +417,7 @@ class EmbeddingDatabase(private val dataDir: File) {
         val trackId: String,
         val sourceText: String,
         val vector: FloatArray,
+        val contentHash: String = "",
         val title: String = "",
         val artist: String = "",
         val album: String = ""
@@ -361,9 +435,10 @@ class EmbeddingDatabase(private val dataDir: File) {
                         stmt.setString(2, r.sourceText)
                         stmt.setBytes(3, floatArrayToBytes(r.vector))
                         stmt.setLong(4, now)
-                        stmt.setString(5, r.title)
-                        stmt.setString(6, r.artist)
-                        stmt.setString(7, r.album)
+                        stmt.setString(5, r.contentHash)
+                        stmt.setString(6, r.title)
+                        stmt.setString(7, r.artist)
+                        stmt.setString(8, r.album)
                         stmt.addBatch()
                     }
                     stmt.executeBatch()
@@ -401,7 +476,11 @@ class EmbeddingDatabase(private val dataDir: File) {
         val trackId: String,
         val sourceText: String,
         val vector: FloatArray,
-        val updatedAt: Long
+        val updatedAt: Long,
+        val contentHash: String = "",
+        val title: String = "",
+        val artist: String = "",
+        val album: String = ""
     ) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -410,5 +489,18 @@ class EmbeddingDatabase(private val dataDir: File) {
         }
 
         override fun hashCode(): Int = trackId.hashCode()
+    }
+
+    private fun readSongRecord(rs: java.sql.ResultSet): SongRecord {
+        return SongRecord(
+            trackId = rs.getString("track_id"),
+            sourceText = rs.getString("source_text"),
+            vector = bytesToFloatArray(rs.getBytes("vector")),
+            updatedAt = rs.getLong("updated_at"),
+            contentHash = rs.getString("content_hash")?.takeIf { it.isNotBlank() }.orEmpty(),
+            title = rs.getString("title")?.takeIf { it.isNotBlank() }.orEmpty(),
+            artist = rs.getString("artist")?.takeIf { it.isNotBlank() }.orEmpty(),
+            album = rs.getString("album")?.takeIf { it.isNotBlank() }.orEmpty()
+        )
     }
 }

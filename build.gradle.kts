@@ -41,6 +41,10 @@ val pluginName = "SPW AI Playlist"
 val pluginDescription = "An AI-powered playlist plugin for SPW."
 val pluginVersion = "1.0.0-test"
 val pluginProvider = "Augustu"
+val workshopPluginsDir = file(System.getenv("APPDATA") + "/Salt Player for Windows/workshop/plugins/")
+val pluginInstallDir = workshopPluginsDir.resolve("SPW-AI-Playlist-$pluginVersion")
+
+fun jarContents() = zipTree(tasks.named<Jar>("jar").get().archiveFile.get())
 
 tasks.named<Jar>("jar") {
     manifest {
@@ -61,22 +65,35 @@ tasks.named<ProcessResources>("processResources") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-tasks.register<Jar>("plugin") {
-    destinationDirectory.set(
-        file(System.getenv("APPDATA") + "/Salt Player for Windows/workshop/plugins/")
-    )
+tasks.register<Zip>("pluginZip") {
+    destinationDirectory.set(workshopPluginsDir)
     archiveFileName.set("SPW-AI-Playlist-$pluginVersion.zip")
-
-    into("classes") {
-        with(tasks.named<Jar>("jar").get())
-    }
-    dependsOn(configurations.runtimeClasspath)
-    into("lib") {
-        from({
-            configurations.runtimeClasspath
-                .get()
-                .filter { it.name.endsWith("jar") }
-        })
-    }
     archiveExtension.set("zip")
+
+    dependsOn(tasks.named("jar"), configurations.runtimeClasspath)
+
+    from({ jarContents() }) {
+        into("classes")
+    }
+    from(configurations.runtimeClasspath) {
+        into("lib")
+        include("*.jar")
+    }
+}
+
+tasks.register<Sync>("deployPlugin") {
+    into(pluginInstallDir)
+    dependsOn(tasks.named("jar"), configurations.runtimeClasspath)
+
+    from({ jarContents() }) {
+        into("classes")
+    }
+    from(configurations.runtimeClasspath) {
+        into("lib")
+        include("*.jar")
+    }
+}
+
+tasks.register("plugin") {
+    dependsOn("pluginZip", "deployPlugin")
 }

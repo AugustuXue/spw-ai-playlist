@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.gg.spwaiplaylist"
-version = "1.0.1"
+version = "1.0.2"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -39,7 +39,7 @@ val pluginClass = "com.gg.spwaiplaylist.MainPlugin"
 val pluginId = "com.gg.spwaiplaylist"
 val pluginName = "SPW AI Playlist"
 val pluginDescription = "An AI-powered playlist plugin for SPW."
-val pluginVersion = "1.0.1"
+val pluginVersion = "1.0.2"
 val pluginProvider = "Augustu"
 val workshopPluginsDir = file(System.getenv("APPDATA") + "/Salt Player for Windows/workshop/plugins/")
 val pluginInstallDir = workshopPluginsDir.resolve("SPW-AI-Playlist-$pluginVersion")

@@ -6,7 +6,11 @@ import com.xuncorp.spw.workshop.api.UnstableSpwWorkshopApi
 import com.xuncorp.spw.workshop.api.WorkshopApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.awt.AWTEvent
@@ -30,6 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 
 @OptIn(UnstableSpwWorkshopApi::class)
 class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
@@ -43,6 +48,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     private val logFlusherRunning = AtomicBoolean(false)
     private var logFlusherThread: Thread? = null
     private var currentSearchJob: kotlinx.coroutines.Job? = null
+    private var pluginScope: CoroutineScope? = null
     @Volatile private var cachedTrackMap: Map<String, Any>? = null
 
     private val awtListener = AWTEventListener { event ->
@@ -81,6 +87,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     @Volatile private var rfPlaybackControllerInstanceField: java.lang.reflect.Field? = null
     @Volatile private var rfSetQueueMethod: java.lang.reflect.Method? = null      // lazy: needs controller runtime class
     @Volatile private var rfPlayMusicAtMethod: java.lang.reflect.Method? = null   // lazy: needs controller runtime class
+    @Volatile private var rfPlaybackQueueStateMethod: java.lang.reflect.Method? = null
 
     // Vri + TagParser (lyrics)
     @Volatile private var rfVriCompanionField: java.lang.reflect.Field? = null
@@ -153,11 +160,13 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         Toolkit.getDefaultToolkit().addAWTEventListener(awtListener, AWTEvent.KEY_EVENT_MASK)
         logDebug("start(): AWT listener registered")
 
+        pluginScope?.cancel()
+        pluginScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         initReflection()
         refreshTrackCache("start()")
 
-        CoroutineScope(Dispatchers.IO).launch {
-            kotlinx.coroutines.delay(5000) // Wait for host to settle
+        pluginScope!!.launch {
+            delay(5000) // Wait for host to settle
             startBackgroundSync()
         }
     }
@@ -188,6 +197,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         try {
             val cls = Class.forName("com.xuncorp.voxzen.service.PlaybackController")
             rfPlaybackControllerInstanceField = cls.getField("INSTANCE")
+            rfPlaybackQueueStateMethod = cls.getMethod("getPlaybackQueueState")
             logDebug("initReflection(): PlaybackController INSTANCE field cached")
         } catch (t: Throwable) { logThrowable("initReflection(): PlaybackController field", t) }
 
@@ -324,7 +334,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             }
 
             refreshTrackCache("startBackgroundSync(): completed sync", tracks)
-            WorkshopApi.ui.toast("AI 歌曲处理完成！共新增 ${processed.get()} 首", WorkshopApi.Ui.ToastType.Success)
+            if (processed.get() > 0) {
+                WorkshopApi.ui.toast("AI 歌曲处理完成！共新增 ${processed.get()} 首", WorkshopApi.Ui.ToastType.Success)
+            } else {
+                logDebug("startBackgroundSync(): no new tracks processed; completion toast suppressed")
+            }
 
         } catch (t: Throwable) {
             logThrowable("startBackgroundSync(): failed", t)
@@ -337,6 +351,10 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     override fun stop() {
         Toolkit.getDefaultToolkit().removeAWTEventListener(awtListener)
         logDebug("stop(): AWT listener removed")
+        currentSearchJob?.cancel()
+        currentSearchJob = null
+        pluginScope?.cancel()
+        pluginScope = null
         if (::embeddingDb.isInitialized) {
             try {
                 embeddingDb.close()
@@ -368,7 +386,8 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         WorkshopApi.ui.toast("🎵 正在探索: $text ...", WorkshopApi.Ui.ToastType.Success)
 
         currentSearchJob?.cancel()
-        currentSearchJob = CoroutineScope(Dispatchers.IO).launch {
+        val scope = pluginScope ?: return
+        currentSearchJob = scope.launch {
             try {
                 if (remoteAi.settings.embeddingApiKey.isBlank()) {
                     logDebug("onEnterPressed(): missing Embedding API key, aborting")
@@ -402,8 +421,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 val queryVector = remoteAi.createEmbedding(queryText)
                 val matches = embeddingDb.findTopMatches(queryVector, queryText, remoteAi.settings.maxPlaybackItems)
                 logDebug("onEnterPressed(): query matched ${matches.size} tracks")
-                matches.forEachIndexed { index, match ->
+                matches.take(10).forEachIndexed { index, match ->
                     logDebug("onEnterPressed(): match#$index trackId=${match.first} score=${match.second}")
+                }
+                if (matches.size > 10) {
+                    logDebug("onEnterPressed(): ${matches.size - 10} lower-ranked matches omitted from debug log")
                 }
 
                 if (matches.isNotEmpty()) {
@@ -524,7 +546,8 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             return
         }
 
-        CoroutineScope(Dispatchers.IO).launch {
+        val scope = pluginScope ?: return
+        scope.launch {
             try {
                 val sourceTracks = loadTracksFromDao()
                 if (sourceTracks.isNullOrEmpty()) {
@@ -725,7 +748,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
      * then starts playback from the first item.
      * setPlaybackQueue and playMusicAt methods are resolved lazily from the controller instance.
      */
-    private fun updatePlaybackQueue(items: List<Any>) {
+    private suspend fun updatePlaybackQueue(items: List<Any>) {
         if (items.isEmpty()) return
         val instanceField = rfPlaybackControllerInstanceField ?: run {
             logDebug("updatePlaybackQueue(): PlaybackController instance field not cached")
@@ -734,15 +757,29 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         val controller = instanceField.get(null)
             ?: throw IllegalStateException("PlaybackController.INSTANCE is null")
 
-        // setPlaybackQueue sends a command to the channel; playMusicAt launches a separate coroutine.
-        // A short delay ensures the queue command is processed before playMusicAt reads queue state.
+        // setPlaybackQueue sends a command to the host channel. Observe its public StateFlow
+        // instead of imposing a fixed 500 ms delay on every search.
         val setQueueMethod = rfSetQueueMethod ?: controller.javaClass.getMethod(
             "setPlaybackQueue", List::class.java, Int::class.javaPrimitiveType
         ).also { rfSetQueueMethod = it }
+        val queueStateFlow = rfPlaybackQueueStateMethod?.invoke(controller) as? StateFlow<*>
+        val stateBeforeSet = queueStateFlow?.value
 
         setQueueMethod.invoke(controller, items, 0)
-        logDebug("updatePlaybackQueue(): setQueue(${items.size}) invoked, waiting for channel to process")
-        Thread.sleep(500)
+        if (queueStateFlow != null && stateBeforeSet != null) {
+            val updated = withTimeoutOrNull(800) {
+                while (queueStateFlow.value === stateBeforeSet) delay(10)
+                true
+            } ?: false
+            logDebug("updatePlaybackQueue(): setQueue(${items.size}) stateUpdated=$updated")
+            if (!updated) {
+                // Preserve correctness on a host version that does not replace the state object.
+                delay(150)
+            }
+        } else {
+            logDebug("updatePlaybackQueue(): StateFlow unavailable, using conservative wait")
+            delay(150)
+        }
 
         val playMusicAtMethod = rfPlayMusicAtMethod ?: controller.javaClass.getMethod(
             "playMusicAt", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType
@@ -879,7 +916,22 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         val step7     = cachedGetField(step6,     "\u0791", "InnerMediator.ޑ",        { rfImStep7 },      { rfImStep7 = it })      ?: return null
         val c2294     = cachedGetField(step7,     "\u0528", "PlatformContext.Ԩ",       { rfPcC2294 },      { rfPcC2294 = it })      ?: return null
         val textState = cachedGetField(c2294,     "\u0528", "TextInputSession.Ԩ",     { rfTisTextState }, { rfTisTextState = it }) ?: return null
-        return textState.toString()
+        return readComposeText(textState)
+    }
+
+    /**
+     * Current Compose's TextEditorState implementation is a CharSequence but does not
+     * override Object.toString(). Copy its characters explicitly; otherwise toString()
+     * yields an internal class name such as androidx.compose.ui.ռ$Ԩ@... .
+     */
+    private fun readComposeText(textState: Any): String? {
+        val value = textState as? CharSequence ?: run {
+            logDebug("readComposeText(): expected CharSequence, actual=${textState.javaClass.name}")
+            return null
+        }
+        val text = StringBuilder(value.length).append(value).toString()
+        logDebug("readComposeText(): stateClass=${textState.javaClass.name}, length=${text.length}")
+        return text
     }
 
     /**
@@ -954,6 +1006,20 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         }.getOrElse { t ->
             logThrowable("resolveAppDatabaseInstance(): load AppDatabase class failed", t)
             return null
+        }
+
+        // Current SPW binary: JADX's Kotlin-metadata display name is VoxzenDatabase,
+        // while reflection must use its raw class/method names: ԫ.Ϳ().
+        runCatching {
+            val holderClass = Class.forName("com.xuncorp.voxzen.data.ԫ")
+            val getInstance = holderClass.getDeclaredMethod("Ϳ").apply { isAccessible = true }
+            val value = getInstance.invoke(null)
+            logDebug(
+                "resolveAppDatabaseInstance(): current raw holder ${holderClass.name}.${getInstance.name}() -> ${value?.javaClass?.name}"
+            )
+            if (value != null && appDbClass.isAssignableFrom(value.javaClass)) return value
+        }.onFailure { t ->
+            logThrowable("resolveAppDatabaseInstance(): current raw holder failed", t)
         }
 
         runCatching {

@@ -5,6 +5,8 @@ import java.nio.ByteBuffer
 import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.SQLException
+import java.util.PriorityQueue
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.sqrt
 
 /**
@@ -20,6 +22,21 @@ class EmbeddingDatabase(private val dataDir: File) {
 
     private val dbFile: File = File(dataDir, "embeddings.db")
     private var connection: Connection? = null
+    /**
+     * Query-time index. Vectors are decoded once at open time, rather than once
+     * per search. A 1536-dimension vector costs about 6 KiB per indexed track.
+     */
+    private val searchIndex = ConcurrentHashMap<String, SearchEntry>()
+
+    private data class SearchEntry(
+        val vector: FloatArray,
+        val vectorNorm: Double,
+        val title: String,
+        val artist: String,
+        val album: String
+    )
+
+    private data class ScoredTrack(val trackId: String, val score: Double)
 
     companion object {
         private const val CREATE_TABLE_SQL = """
@@ -93,6 +110,7 @@ class EmbeddingDatabase(private val dataDir: File) {
             }
         }
         migrateIfNeeded()
+        rebuildSearchIndex()
     }
 
     /**
@@ -122,6 +140,7 @@ class EmbeddingDatabase(private val dataDir: File) {
     fun close() {
         connection?.close()
         connection = null
+        searchIndex.clear()
     }
 
     /**
@@ -150,6 +169,13 @@ class EmbeddingDatabase(private val dataDir: File) {
             stmt.setString(8, album)
             stmt.executeUpdate()
         } ?: throw SQLException("Database not open")
+        searchIndex[trackId] = SearchEntry(
+            vector = vector.copyOf(),
+            vectorNorm = vectorNorm(vector),
+            title = title.lowercase(),
+            artist = artist.lowercase(),
+            album = album.lowercase()
+        )
     }
 
     /**
@@ -219,17 +245,26 @@ class EmbeddingDatabase(private val dataDir: File) {
             stmt.setString(6, existingTrackId)
             stmt.executeUpdate()
         } ?: throw SQLException("Database not open")
+        searchIndex.remove(existingTrackId)?.let { existing ->
+            searchIndex[newTrackId] = existing.copy(
+                title = title.lowercase(),
+                artist = artist.lowercase(),
+                album = album.lowercase()
+            )
+        }
     }
 
     /**
      * Deletes a record by track ID.
      */
     @Throws(SQLException::class)
+    @Synchronized
     fun delete(trackId: String) {
         connection?.prepareStatement(DELETE_SQL)?.use { stmt ->
             stmt.setString(1, trackId)
             stmt.executeUpdate()
         }
+        searchIndex.remove(trackId)
     }
 
     /**
@@ -276,26 +311,32 @@ class EmbeddingDatabase(private val dataDir: File) {
      * queries like "周杰伦" (artist name) reliably surface that artist's songs.
      */
     fun findTopMatches(queryVector: FloatArray, queryText: String, limit: Int): List<Pair<String, Double>> {
+        if (limit <= 0) return emptyList()
         val queryLower = queryText.trim().lowercase()
-        val result = mutableListOf<Pair<String, Double>>()
-        connection?.prepareStatement("SELECT track_id, vector, title, artist, album FROM songs_embedding")?.use { stmt ->
-            stmt.executeQuery().use { rs ->
-                while (rs.next()) {
-                    val trackId = rs.getString("track_id")
-                    val vector = bytesToFloatArray(rs.getBytes("vector"))
-                    val title = rs.getString("title")?.lowercase().orEmpty()
-                    val artist = rs.getString("artist")?.lowercase().orEmpty()
-                    val album = rs.getString("album")?.lowercase().orEmpty()
-                    val cosine = cosineSimilarity(queryVector, vector)
-                    val bonus = computeMetadataBonus(queryLower, title, artist, album)
-                    val score = cosine + bonus
-                    if (score >= 0.25) {
-                        result.add(trackId to score)
-                    }
-                }
+        val queryNorm = vectorNorm(queryVector)
+        if (queryNorm == 0.0) return emptyList()
+
+        // Heap head is the worst retained candidate. This avoids sorting every
+        // indexed song when only the first K are needed.
+        val topMatches = PriorityQueue<ScoredTrack>(
+            compareBy<ScoredTrack> { it.score }.thenByDescending { it.trackId }
+        )
+        searchIndex.forEach { (trackId, entry) ->
+            val score = cosineSimilarity(queryVector, queryNorm, entry) +
+                computeMetadataBonus(queryLower, entry.title, entry.artist, entry.album)
+            if (score < 0.25) return@forEach
+
+            val candidate = ScoredTrack(trackId, score)
+            if (topMatches.size < limit) {
+                topMatches.add(candidate)
+            } else if (topMatches.comparator().compare(candidate, topMatches.peek()) > 0) {
+                topMatches.poll()
+                topMatches.add(candidate)
             }
         }
-        return result.sortedByDescending { it.second }.take(limit)
+        return topMatches
+            .sortedWith(compareByDescending<ScoredTrack> { it.score }.thenBy { it.trackId })
+            .map { it.trackId to it.score }
     }
 
     /**
@@ -350,6 +391,9 @@ class EmbeddingDatabase(private val dataDir: File) {
             stmt.setString(3, album)
             stmt.setString(4, trackId)
             stmt.executeUpdate()
+        }
+        searchIndex.computeIfPresent(trackId) { _, existing ->
+            existing.copy(title = title.lowercase(), artist = artist.lowercase(), album = album.lowercase())
         }
     }
 
@@ -424,6 +468,7 @@ class EmbeddingDatabase(private val dataDir: File) {
     )
 
     @Throws(SQLException::class)
+    @Synchronized
     fun upsertBatch(records: List<BatchRecord>) {
         connection?.let { conn ->
             conn.autoCommit = false
@@ -444,6 +489,15 @@ class EmbeddingDatabase(private val dataDir: File) {
                     stmt.executeBatch()
                 }
                 conn.commit()
+                records.forEach { record ->
+                    searchIndex[record.trackId] = SearchEntry(
+                        vector = record.vector.copyOf(),
+                        vectorNorm = vectorNorm(record.vector),
+                        title = record.title.lowercase(),
+                        artist = record.artist.lowercase(),
+                        album = record.album.lowercase()
+                    )
+                }
             } catch (e: Exception) {
                 conn.rollback()
                 throw e
@@ -468,6 +522,42 @@ class EmbeddingDatabase(private val dataDir: File) {
             arr[i] = buffer.getFloat()
         }
         return arr
+    }
+
+    @Synchronized
+    private fun rebuildSearchIndex() {
+        val conn = connection ?: return
+        val rebuilt = HashMap<String, SearchEntry>()
+        conn.prepareStatement("SELECT track_id, vector, title, artist, album FROM songs_embedding").use { stmt ->
+            stmt.executeQuery().use { rs ->
+                while (rs.next()) {
+                    val vector = bytesToFloatArray(rs.getBytes("vector"))
+                    rebuilt[rs.getString("track_id")] = SearchEntry(
+                        vector = vector,
+                        vectorNorm = vectorNorm(vector),
+                        title = rs.getString("title")?.lowercase().orEmpty(),
+                        artist = rs.getString("artist")?.lowercase().orEmpty(),
+                        album = rs.getString("album")?.lowercase().orEmpty()
+                    )
+                }
+            }
+        }
+        searchIndex.clear()
+        searchIndex.putAll(rebuilt)
+    }
+
+    private fun vectorNorm(vector: FloatArray): Double {
+        var sum = 0.0
+        for (value in vector) sum += value.toDouble() * value.toDouble()
+        return sqrt(sum)
+    }
+
+    private fun cosineSimilarity(query: FloatArray, queryNorm: Double, entry: SearchEntry): Double {
+        if (entry.vectorNorm == 0.0) return 0.0
+        var dot = 0.0
+        val size = minOf(query.size, entry.vector.size)
+        for (i in 0 until size) dot += query[i].toDouble() * entry.vector[i].toDouble()
+        return dot / (queryNorm * entry.vectorNorm)
     }
 
     // --- Data class ---

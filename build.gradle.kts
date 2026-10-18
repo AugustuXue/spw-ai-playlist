@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.gg.spwaiplaylist"
-version = "1.1.0"
+version = "1.1.1"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_25

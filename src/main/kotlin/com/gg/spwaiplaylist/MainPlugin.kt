@@ -107,8 +107,8 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             openDebugLogWriter()
         }
 
-        logDebug("start(): pluginPath=${pluginContext.pluginPath}")
-        logDebug("start(): pluginDataDir=$pluginDataDir")
+        logDebug { "start(): pluginPath=${pluginContext.pluginPath}" }
+        logDebug { "start(): pluginDataDir=$pluginDataDir" }
 
         try {
             Class.forName("org.sqlite.JDBC")
@@ -122,7 +122,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         embeddingDb = EmbeddingDatabase(pluginDataDir)
         try {
             embeddingDb.open()
-            logDebug("start(): sqlite opened, count=${embeddingDb.count()}")
+            logDebug { "start(): sqlite opened, count=${embeddingDb.count()}" }
         } catch (t: Throwable) {
             logThrowable("start(): sqlite open failed", t)
             WorkshopApi.ui.toast("嵌入数据库初始化失败", WorkshopApi.Ui.ToastType.Error)
@@ -131,13 +131,13 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
 
         remoteAi = try {
             val settings = RemoteAiSettings.from(config)
-            logDebug(
+            logDebug {
                 "start(): remote AI config loaded, " +
                     "embeddingModel=${settings.embeddingModel}, chatModel=${settings.chatModel}, " +
                     "embeddingUrl=${settings.embeddingBaseUrl}, chatUrl=${settings.chatBaseUrl}, " +
                     "hasEmbeddingKey=${settings.embeddingApiKey.isNotBlank()}, " +
-                    "hasChatKey=${settings.chatApiKey.isNotBlank()}"
-            )
+                "hasChatKey=${settings.chatApiKey.isNotBlank()}"
+            }
             RemoteAiClients(settings, ::logDebug)
         } catch (t: Throwable) {
             logThrowable("start(): remote AI config load failed", t)
@@ -229,7 +229,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             // Backfill metadata for existing records that were indexed before artist/title/album columns existed
             val needsBackfill = embeddingDb.getTrackIdsWithEmptyMetadata()
             if (needsBackfill.isNotEmpty()) {
-                logDebug("startBackgroundSync(): backfilling metadata for ${needsBackfill.size} existing records")
+                logDebug { "startBackgroundSync(): backfilling metadata for ${needsBackfill.size} existing records" }
                 var backfilled = 0
                 for (track in tracks) {
                     val id = track.id.takeIf { it.isNotBlank() } ?: continue
@@ -240,19 +240,34 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                     embeddingDb.updateMetadata(id, title, artist, album)
                     backfilled++
                 }
-                logDebug("startBackgroundSync(): backfilled $backfilled records")
+                logDebug { "startBackgroundSync(): backfilled $backfilled records" }
             }
 
-            val pendingTracks = tracks.filter { track ->
+            val candidateTracks = tracks.filter { track ->
                 track.id.isNotBlank() && track.id !in existingIds
             }
 
+            // The host's track ID can change for an otherwise unchanged media
+            // item. Reconcile those candidates before reporting them as new;
+            // otherwise the metadata fallback below would suppress AI work
+            // only after a misleading "found N new tracks" toast was shown.
+            val pendingTracks = candidateTracks.mapNotNull { track ->
+                preparePendingTrack(track)
+            }
+
+            if (candidateTracks.size != pendingTracks.size) {
+                logDebug {
+                    "startBackgroundSync(): reconciled ${candidateTracks.size - pendingTracks.size} " +
+                        "ID-mismatched candidates as already indexed"
+                }
+            }
+
             if (pendingTracks.isEmpty()) {
-                logDebug("startBackgroundSync(): all ${tracks.size} tracks already synced.")
+                logDebug { "startBackgroundSync(): all ${tracks.size} tracks already synced." }
                 return
             }
 
-            logDebug("startBackgroundSync(): found ${pendingTracks.size} new tracks to sync.")
+            logDebug { "startBackgroundSync(): found ${pendingTracks.size} new tracks to sync." }
             WorkshopApi.ui.toast("发现 ${pendingTracks.size} 首新歌，开始后台AI处理...", WorkshopApi.Ui.ToastType.Success)
 
             val processed = AtomicInteger(0)
@@ -261,10 +276,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             val delayMs = remoteAi.settings.requestDelayMs
 
             if (threadCount <= 1) {
-                for (track in pendingTracks) {
+                for (pendingTrack in pendingTracks) {
+                    val track = pendingTrack.track
                     var success = false
                     while (!success) {
-                        val result = seedFirstTrack(track, false)
+                        val result = seedFirstTrack(track, false, pendingTrack.contentHash)
                         if (result == SeedResult.SUCCESS) {
                             val current = processed.incrementAndGet()
                             WorkshopApi.ui.toast("AI 处理中: $current / $total", WorkshopApi.Ui.ToastType.Success)
@@ -290,10 +306,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                             while (true) {
                                 val i = index.getAndIncrement()
                                 if (i >= pendingTracks.size) break
-                                val track = pendingTracks[i]
+                                val pendingTrack = pendingTracks[i]
+                                val track = pendingTrack.track
                                 var success = false
                                 while (!success) {
-                                    val result = seedFirstTrack(track, true)
+                                    val result = seedFirstTrack(track, true, pendingTrack.contentHash)
                                     if (result == SeedResult.SUCCESS) {
                                         val current = processed.incrementAndGet()
                                         WorkshopApi.ui.toast("AI 处理中: $current / $total", WorkshopApi.Ui.ToastType.Success)
@@ -366,7 +383,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             return
         }
 
-        logDebug("onEnterPressed(): captured text='$text'")
+        logDebug { "onEnterPressed(): captured text='$text'" }
         WorkshopApi.ui.toast("🎵 正在探索: $text ...", WorkshopApi.Ui.ToastType.Success)
 
         currentSearchJob?.cancel()
@@ -393,23 +410,23 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                         return@launch
                     }
                     val expanded = remoteAi.expandQuery(text)
-                    logDebug("onEnterPressed(): query expanded from '$text' to '$expanded'")
+                    logDebug { "onEnterPressed(): query expanded from '$text' to '$expanded'" }
                     expanded
                 } else {
                     if (remoteAi.settings.enableQueryExpansion) {
-                        logDebug("onEnterPressed(): query expansion skipped for constrained query='$text'")
+                        logDebug { "onEnterPressed(): query expansion skipped for constrained query='$text'" }
                     }
                     text
                 }
 
                 val queryVector = remoteAi.createEmbedding(queryText)
                 val matches = embeddingDb.findTopMatches(queryVector, queryText, remoteAi.settings.maxPlaybackItems)
-                logDebug("onEnterPressed(): query matched ${matches.size} tracks")
+                logDebug { "onEnterPressed(): query matched ${matches.size} tracks" }
                 matches.take(10).forEachIndexed { index, match ->
-                    logDebug("onEnterPressed(): match#$index trackId=${match.first} score=${match.second}")
+                    logDebug { "onEnterPressed(): match#$index trackId=${match.first} score=${match.second}" }
                 }
                 if (matches.size > 10) {
-                    logDebug("onEnterPressed(): ${matches.size - 10} lower-ranked matches omitted from debug log")
+                    logDebug { "onEnterPressed(): ${matches.size - 10} lower-ranked matches omitted from debug log" }
                 }
 
                 if (matches.isNotEmpty()) {
@@ -417,7 +434,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                         val trackId = match.first
                         val track = trackMap[trackId]
                         if (track == null) {
-                            logDebug("onEnterPressed(): trackId=$trackId not found in trackMap, skipping")
+                            logDebug { "onEnterPressed(): trackId=$trackId not found in trackMap, skipping" }
                             null
                         } else {
                             buildPlaybackItem(track)
@@ -425,7 +442,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                     }
                     if (playbackItems.isNotEmpty()) {
                         updatePlaybackQueue(playbackItems)
-                        logDebug("onEnterPressed(): playback queue replaced with ${playbackItems.size} matched tracks")
+                        logDebug { "onEnterPressed(): playback queue replaced with ${playbackItems.size} matched tracks" }
                         WorkshopApi.ui.toast("✨ 已为您生成「$text」的专属播放列表", WorkshopApi.Ui.ToastType.Success)
                     } else {
                         WorkshopApi.ui.toast("抱歉，匹配到的歌曲无法播放", WorkshopApi.Ui.ToastType.Warning)
@@ -473,7 +490,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 return null
             }
             WorkshopApi.library.getAllTracks().toCompletableFuture().get().also {
-                logDebug("getAllTracks(): WorkshopApi.library returned ${it.size} tracks")
+                logDebug { "getAllTracks(): WorkshopApi.library returned ${it.size} tracks" }
             }
         } catch (t: Throwable) {
             logThrowable("getAllTracks(): failure", t)
@@ -485,7 +502,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         if (tracks != null) {
             try {
                 cachedTrackMap = loadTrackMapFromTracks(tracks)
-                logDebug("refreshTrackCache($reason): cached ${tracks.size} tracks, mapSize=${cachedTrackMap?.size ?: -1}")
+                logDebug { "refreshTrackCache($reason): cached ${tracks.size} tracks, mapSize=${cachedTrackMap?.size ?: -1}" }
             } catch (t: Throwable) {
                 logThrowable("refreshTrackCache($reason): failure", t)
             }
@@ -497,11 +514,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             try {
                 val sourceTracks = getAllTracks()
                 if (sourceTracks.isNullOrEmpty()) {
-                    logDebug("refreshTrackCache($reason): no tracks loaded")
+                    logDebug { "refreshTrackCache($reason): no tracks loaded" }
                     return@launch
                 }
                 cachedTrackMap = loadTrackMapFromTracks(sourceTracks)
-                logDebug("refreshTrackCache($reason): cached ${sourceTracks.size} tracks, mapSize=${cachedTrackMap?.size ?: -1}")
+                logDebug { "refreshTrackCache($reason): cached ${sourceTracks.size} tracks, mapSize=${cachedTrackMap?.size ?: -1}" }
             } catch (t: Throwable) {
                 logThrowable("refreshTrackCache($reason): failure", t)
             }
@@ -528,45 +545,110 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         ERROR
     }
 
-    private fun seedFirstTrack(track: MediaItem, checkExisting: Boolean): SeedResult {
+    private data class PendingTrack(
+        val track: MediaItem,
+        val contentHash: String
+    )
+
+    /**
+     * Resolves an ID-mismatched library item before it contributes to the
+     * user-facing new-track count. This mirrors seedFirstTrack's identity
+     * order and returns a cached hash for genuinely new items so the file is
+     * not hashed a second time during processing.
+     */
+    private fun preparePendingTrack(track: MediaItem): PendingTrack? {
+        return try {
+            val trackId = track.id.takeIf { it.isNotBlank() }
+                ?: return null
+            val title = track.title
+            val artist = track.artist
+            val album = track.album
+            val contentHash = buildTrackContentHash(track)
+
+            if (embeddingDb.getById(trackId) != null) {
+                logDebug { "startBackgroundSync(): candidate already indexed by trackId=$trackId" }
+                return null
+            }
+
+            val existingByHash = if (contentHash.isNotBlank()) embeddingDb.getByHash(contentHash) else null
+            if (existingByHash != null) {
+                if (existingByHash.trackId != trackId) {
+                    embeddingDb.rekey(existingByHash.trackId, trackId, contentHash, title, artist, album)
+                    logDebug {
+                        "startBackgroundSync(): rekeyed existing candidate by hash " +
+                            "oldTrackId=${existingByHash.trackId} newTrackId=$trackId"
+                    }
+                }
+                return null
+            }
+
+            val existingByMetadata = embeddingDb.getByMetadata(title, artist, album)
+            if (existingByMetadata != null) {
+                if (contentHash.isNotBlank() && existingByMetadata.contentHash.isBlank() && existingByMetadata.trackId != trackId) {
+                    embeddingDb.rekey(existingByMetadata.trackId, trackId, contentHash, title, artist, album)
+                    logDebug {
+                        "startBackgroundSync(): rekeyed existing candidate by metadata " +
+                            "oldTrackId=${existingByMetadata.trackId} newTrackId=$trackId"
+                    }
+                } else {
+                    logDebug {
+                        "startBackgroundSync(): candidate already indexed by metadata " +
+                            "title='$title' artist='$artist' album='$album'"
+                    }
+                }
+                return null
+            }
+
+            PendingTrack(track, contentHash)
+        } catch (t: Throwable) {
+            logThrowable("startBackgroundSync(): candidate reconciliation failed", t)
+            PendingTrack(track, "")
+        }
+    }
+
+    private fun seedFirstTrack(
+        track: MediaItem,
+        checkExisting: Boolean,
+        precomputedContentHash: String? = null
+    ): SeedResult {
         return try {
             val trackId = track.id.takeIf { it.isNotBlank() }
                 ?: throw IllegalStateException("Track id missing")
             val title = track.title
             val artist = track.artist
             val album = track.album
-            val contentHash = buildTrackContentHash(track)
+            val contentHash = precomputedContentHash ?: buildTrackContentHash(track)
             val existingById = embeddingDb.getById(trackId)
             if (existingById != null) {
-                logDebug("seedFirstTrack(): skipped existing trackId=$trackId")
+                logDebug { "seedFirstTrack(): skipped existing trackId=$trackId" }
                 return SeedResult.SKIPPED
             }
             val existingByHash = if (contentHash.isNotBlank()) embeddingDb.getByHash(contentHash) else null
             if (existingByHash != null) {
                 embeddingDb.rekey(existingByHash.trackId, trackId, contentHash, title, artist, album)
-                logDebug("seedFirstTrack(): rekeyed by hash oldTrackId=${existingByHash.trackId} newTrackId=$trackId")
+                logDebug { "seedFirstTrack(): rekeyed by hash oldTrackId=${existingByHash.trackId} newTrackId=$trackId" }
                 return SeedResult.SKIPPED
             }
             val existingByMetadata = embeddingDb.getByMetadata(title, artist, album)
             if (existingByMetadata != null) {
                 if (contentHash.isNotBlank() && existingByMetadata.contentHash.isBlank()) {
                     embeddingDb.rekey(existingByMetadata.trackId, trackId, contentHash, title, artist, album)
-                    logDebug("seedFirstTrack(): rekeyed by metadata oldTrackId=${existingByMetadata.trackId} newTrackId=$trackId")
+                    logDebug { "seedFirstTrack(): rekeyed by metadata oldTrackId=${existingByMetadata.trackId} newTrackId=$trackId" }
                     return SeedResult.SKIPPED
                 }
-                logDebug("seedFirstTrack(): skipped existing metadata title='$title' artist='$artist' album='$album'")
+                logDebug { "seedFirstTrack(): skipped existing metadata title='$title' artist='$artist' album='$album'" }
                 return SeedResult.SKIPPED
             }
             val sourceText = buildTrackSourceText(track)
-            logDebug("seedFirstTrack(): trackId=$trackId sourceTextLength=${sourceText.length}")
+            logDebug { "seedFirstTrack(): trackId=$trackId sourceTextLength=${sourceText.length}" }
 
             val description = remoteAi.generateTrackDescription(sourceText)
-            logDebug("seedFirstTrack(): descriptionLength=${description.length}")
+            logDebug { "seedFirstTrack(): descriptionLength=${description.length}" }
 
             val embeddingInput = buildEmbeddingInput(sourceText, description)
             val vector = remoteAi.createEmbedding(embeddingInput)
             embeddingDb.upsert(trackId, embeddingInput, vector, contentHash, title, artist, album)
-            logDebug("seedFirstTrack(): upserted trackId=$trackId vectorSize=${vector.size}")
+            logDebug { "seedFirstTrack(): upserted trackId=$trackId vectorSize=${vector.size}" }
             SeedResult.SUCCESS
         } catch (t: Throwable) {
             logThrowable("seedFirstTrack(): failure", t)
@@ -585,7 +667,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         val year = track.year.toString()
         val lyrics = normalizeLyrics(readTrackLyrics(track.path).orEmpty())
 
-        logDebug("buildTrackSourceText(): lyricsIncluded=${lyrics.isNotBlank()} lyricsLength=${lyrics.length}")
+        logDebug { "buildTrackSourceText(): lyricsIncluded=${lyrics.isNotBlank()} lyricsLength=${lyrics.length}" }
 
         return buildString {
             appendLine("歌名：$title")
@@ -650,10 +732,10 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             // Convert: "file:///D:/Music/x.flac" → "D:\Music\x.flac" (Windows)
             val path = fileUriToOsPath(rawPath)
             if (id.isBlank() || path.isBlank()) {
-                logDebug("buildPlaybackItem(): missing id or path for trackId=$id")
+                logDebug { "buildPlaybackItem(): missing id or path for trackId=$id" }
                 return null
             }
-            logDebug("buildPlaybackItem(): id=$id title='$title' artist='$artist' path='$path'")
+            logDebug { "buildPlaybackItem(): id=$id title='$title' artist='$artist' path='$path'" }
             val ctor = rfPiscesItemCtor ?: run {
                 logDebug("buildPlaybackItem(): PiscesMediaItem ctor not cached")
                 return null
@@ -717,7 +799,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 while (queueStateFlow.value === stateBeforeSet) delay(10)
                 true
             } ?: false
-            logDebug("updatePlaybackQueue(): setQueue(${items.size}) stateUpdated=$updated")
+            logDebug { "updatePlaybackQueue(): setQueue(${items.size}) stateUpdated=$updated" }
             if (!updated) {
                 // Preserve correctness on a host version that does not replace the state object.
                 delay(150)
@@ -784,7 +866,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
 
             val companion = companionField.get(null)
             val vri = parseMethod.invoke(companion, path) ?: run {
-                logDebug("readTrackLyrics(): Vri parse returned null for path='$path'")
+                logDebug { "readTrackLyrics(): Vri parse returned null for path='$path'" }
                 return null
             }
             val tagParser = tagParserField.get(null)
@@ -793,9 +875,9 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 is String -> result.trim().takeIf { it.isNotBlank() }
                 else -> result?.toString()?.trim()?.takeIf { it.isNotBlank() }
             }
-            logDebug(
+            logDebug {
                 "readTrackLyrics(): path='$path' resultType=${result?.javaClass?.name} lyricsLength=${lyrics?.length ?: 0}"
-            )
+            }
             lyrics
         } catch (t: Throwable) {
             logThrowable("readTrackLyrics(): failure", t)
@@ -877,9 +959,9 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 .apply { isAccessible = true }
                 .also { rfTextEditorStateGetText = it }
             val text = (getText.invoke(state) as? String)?.takeIf { it.isNotBlank() }
-            logDebug(
+            logDebug {
                 "readNewTextInputState(): stateClass=${state.javaClass.name}, textLength=${text?.length ?: 0}"
-            )
+            }
             text
         } catch (t: Throwable) {
             logThrowable("readNewTextInputState(): failed", t)
@@ -903,7 +985,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             return try {
                 val value = cached.get(obj)
                 if (debugLogEnabled) {
-                    logDebug("cachedGetField(): $label cache hit in ${cached.declaringClass.name}, valueClass=${value?.javaClass?.name}")
+                    logDebug { "cachedGetField(): $label cache hit in ${cached.declaringClass.name}, valueClass=${value?.javaClass?.name}" }
                 }
                 value
             } catch (t: Throwable) {
@@ -920,18 +1002,20 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 val value = field.get(obj)
                 setCache(field)
                 if (debugLogEnabled) {
-                    logDebug("cachedGetField(): $label cached from ${c.name}, valueClass=${value?.javaClass?.name}")
+                    val cachedClass = c
+                    logDebug { "cachedGetField(): $label cached from ${cachedClass.name}, valueClass=${value?.javaClass?.name}" }
                 }
                 return value
             } catch (_: NoSuchFieldException) {
                 c = c.superclass
             } catch (t: Throwable) {
-                logThrowable("cachedGetField(): $label failed in ${c.name}", t)
+                val failedClass = c
+                logThrowable("cachedGetField(): $label failed in ${failedClass.name}", t)
                 return null
             }
         }
         if (debugLogEnabled) {
-            logDebug("cachedGetField(): $label not found from ${obj.javaClass.name}")
+            logDebug { "cachedGetField(): $label not found from ${obj.javaClass.name}" }
         }
         return null
     }
@@ -1005,6 +1089,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         if (debugLogWriter == null) {
             openDebugLogWriter()
         }
+    }
+
+    private fun logDebug(message: () -> String) {
+        if (!debugLogEnabled) return
+        logDebug(message())
     }
 
 }

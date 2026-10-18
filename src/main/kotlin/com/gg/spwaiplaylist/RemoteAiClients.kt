@@ -33,15 +33,22 @@ class RemoteAiSettings(
             return RemoteAiSettings(
                 embeddingApiKey = config.get("remote_ai.embedding_api_key", "") as String,
                 chatApiKey = config.get("remote_ai.chat_api_key", "") as String,
-                embeddingModel = config.get("remote_ai.embedding_model", DEFAULT_EMBEDDING_MODEL) as String,
-                chatModel = config.get("remote_ai.chat_model", DEFAULT_CHAT_MODEL) as String,
-                embeddingBaseUrl = config.get("remote_ai.embedding_base_url", DEFAULT_EMBEDDING_BASE_URL) as String,
-                chatBaseUrl = config.get("remote_ai.chat_base_url", DEFAULT_CHAT_BASE_URL) as String,
+                embeddingModel = configString(config, "remote_ai.embedding_model", DEFAULT_EMBEDDING_MODEL),
+                chatModel = configString(config, "remote_ai.chat_model", DEFAULT_CHAT_MODEL),
+                embeddingBaseUrl = configString(config, "remote_ai.embedding_base_url", DEFAULT_EMBEDDING_BASE_URL),
+                chatBaseUrl = configString(config, "remote_ai.chat_base_url", DEFAULT_CHAT_BASE_URL),
                 ragThreadCount = (config.get("rag.thread_count", "1") as String).toIntOrNull()?.coerceAtLeast(1) ?: 1,
                 maxPlaybackItems = (config.get("rag.max_playback_items", "20") as String).toIntOrNull()?.coerceAtLeast(1) ?: 20,
                 requestDelayMs = (config.get("rag.request_delay_ms", "1000") as String).toLongOrNull()?.coerceAtLeast(0L) ?: 1000L,
                 enableQueryExpansion = config.get("rag.enable_query_expansion", false) as Boolean,
             )
+        }
+
+        private fun configString(config: ConfigHelper, key: String, defaultValue: String): String {
+            return (config.get(key, defaultValue) as? String)
+                ?.trim()
+                ?.ifBlank { defaultValue }
+                ?: defaultValue
         }
 
         fun empty(): RemoteAiSettings {

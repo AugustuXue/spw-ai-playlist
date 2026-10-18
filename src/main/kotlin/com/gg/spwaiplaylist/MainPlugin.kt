@@ -1,6 +1,8 @@
 package com.gg.spwaiplaylist
 
 import com.xuncorp.spw.workshop.api.PluginContext
+import com.xuncorp.spw.workshop.api.PluginPermission
+import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint.MediaItem
 import com.xuncorp.spw.workshop.api.SpwPlugin
 import com.xuncorp.spw.workshop.api.UnstableSpwWorkshopApi
 import com.xuncorp.spw.workshop.api.WorkshopApi
@@ -9,9 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.awt.AWTEvent
 import java.awt.KeyboardFocusManager
@@ -49,7 +49,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     private var logFlusherThread: Thread? = null
     private var currentSearchJob: kotlinx.coroutines.Job? = null
     private var pluginScope: CoroutineScope? = null
-    @Volatile private var cachedTrackMap: Map<String, Any>? = null
+    @Volatile private var cachedTrackMap: Map<String, MediaItem>? = null
 
     private val awtListener = AWTEventListener { event ->
         if (event is KeyEvent && event.id == KeyEvent.KEY_PRESSED && event.keyCode == KeyEvent.VK_ENTER) {
@@ -66,20 +66,6 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     // @Volatile ensures cross-thread visibility for lazy-resolved fields.
     // -------------------------------------------------------------------------
 
-    // AppDatabase chain
-    @Volatile private var rfAppDbInstanceField: java.lang.reflect.Field? = null
-    @Volatile private var rfTrackDaoMethod: java.lang.reflect.Method? = null      // lazy: needs db runtime class
-    @Volatile private var rfGetAllFlowMethod: java.lang.reflect.Method? = null    // lazy: needs trackDao runtime class
-
-    // Track getters (lazy: needs Track runtime class, resolved on first getAllTracks() result)
-    @Volatile private var rfTrackGetId: java.lang.reflect.Method? = null
-    @Volatile private var rfTrackGetTitle: java.lang.reflect.Method? = null
-    @Volatile private var rfTrackGetArtist: java.lang.reflect.Method? = null
-    @Volatile private var rfTrackGetAlbum: java.lang.reflect.Method? = null
-    @Volatile private var rfTrackGetAlbumArtist: java.lang.reflect.Method? = null
-    @Volatile private var rfTrackGetYear: java.lang.reflect.Method? = null
-    @Volatile private var rfTrackGetPath: java.lang.reflect.Method? = null
-
     // PiscesMediaItem
     @Volatile private var rfPiscesItemCtor: java.lang.reflect.Constructor<*>? = null
 
@@ -95,21 +81,22 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     @Volatile private var rfTagParserInstanceField: java.lang.reflect.Field? = null
     @Volatile private var rfReadLyricsMethod: java.lang.reflect.Method? = null
 
-    // Compose search-box chain (lazy: resolved on first successful getSearchText call)
+    // Compose 1.19 search-box chain (lazy: resolved on first successful getSearchText call)
     @Volatile private var rfCwPanel: java.lang.reflect.Field? = null
     @Volatile private var rfCwpContainer: java.lang.reflect.Field? = null
     @Volatile private var rfCcMediator: java.lang.reflect.Field? = null
-    @Volatile private var rfCsmSceneLazy: java.lang.reflect.Field? = null
-    @Volatile private var rfCsStep5: java.lang.reflect.Field? = null
-    @Volatile private var rfDcsStep6: java.lang.reflect.Field? = null
-    @Volatile private var rfImStep7: java.lang.reflect.Field? = null
-    @Volatile private var rfPcC2294: java.lang.reflect.Field? = null
-    @Volatile private var rfTisTextState: java.lang.reflect.Field? = null
+    @Volatile private var rfCsmGetTextInputService2: java.lang.reflect.Method? = null
+    @Volatile private var cachedTextInputMediator: Any? = null
+    @Volatile private var cachedTextInputService2: Any? = null
+    @Volatile private var rfDtis2InputMethodSession: java.lang.reflect.Field? = null
+    @Volatile private var rfInputSessionRequest: java.lang.reflect.Field? = null
+    @Volatile private var rfRequestGetState: java.lang.reflect.Method? = null
+    @Volatile private var rfTextEditorStateGetText: java.lang.reflect.Method? = null
 
     // -------------------------------------------------------------------------
 
     override fun start() {
-        val configManager = WorkshopApi.manager.createConfigManager(pluginContext.pluginId)
+        val configManager = WorkshopApi.manager.createConfigManager()
         val config = configManager.getConfig()
         val pluginDataDir = config.getConfigPath().toFile().parentFile
         val logFlag = config.get("debug.enable_file_log", false)
@@ -162,6 +149,10 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
 
         pluginScope?.cancel()
         pluginScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        if (!WorkshopApi.manager.isPermissionGranted(PluginPermission.LIBRARY_READ)) {
+            logDebug("start(): LIBRARY_READ permission is not granted; library features are unavailable")
+            WorkshopApi.ui.toast("请在插件权限中授权“读取音乐库”后重启插件", WorkshopApi.Ui.ToastType.Warning)
+        }
         initReflection()
         refreshTrackCache("start()")
 
@@ -177,12 +168,6 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
      * resolved lazily on first use and stored in the same @Volatile fields.
      */
     private fun initReflection() {
-        // AppDatabase class handle only; the actual singleton is resolved dynamically at runtime.
-        try {
-            Class.forName("com.xuncorp.voxzen.data.AppDatabase")
-            logDebug("initReflection(): AppDatabase class loaded")
-        } catch (t: Throwable) { logThrowable("initReflection(): AppDatabase class", t) }
-
         // PiscesMediaItem 6-arg constructor
         try {
             val cls = Class.forName("com.xuncorp.pisces.PiscesMediaItem")
@@ -247,11 +232,11 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 logDebug("startBackgroundSync(): backfilling metadata for ${needsBackfill.size} existing records")
                 var backfilled = 0
                 for (track in tracks) {
-                    val id = trackValue(track, "getId")?.toString() ?: continue
+                    val id = track.id.takeIf { it.isNotBlank() } ?: continue
                     if (id !in needsBackfill) continue
-                    val title = trackValue(track, "getTitle")?.toString().orEmpty()
-                    val artist = trackValue(track, "getArtist")?.toString().orEmpty()
-                    val album = trackValue(track, "getAlbum")?.toString().orEmpty()
+                    val title = track.title
+                    val artist = track.artist
+                    val album = track.album
                     embeddingDb.updateMetadata(id, title, artist, album)
                     backfilled++
                 }
@@ -259,8 +244,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
             }
 
             val pendingTracks = tracks.filter { track ->
-                val id = trackValue(track, "getId")?.toString()
-                id != null && id !in existingIds
+                track.id.isNotBlank() && track.id !in existingIds
             }
 
             if (pendingTracks.isEmpty()) {
@@ -482,60 +466,22 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
 
 
 
-    @Suppress("UNCHECKED_CAST")
-    private suspend fun getAllTracks(): List<Any>? {
+    private suspend fun getAllTracks(): List<MediaItem>? {
         return try {
-            loadTracksFromDao()
+            if (!WorkshopApi.manager.isPermissionGranted(PluginPermission.LIBRARY_READ)) {
+                logDebug("getAllTracks(): LIBRARY_READ permission is not granted")
+                return null
+            }
+            WorkshopApi.library.getAllTracks().toCompletableFuture().get().also {
+                logDebug("getAllTracks(): WorkshopApi.library returned ${it.size} tracks")
+            }
         } catch (t: Throwable) {
             logThrowable("getAllTracks(): failure", t)
             null
         }
     }
 
-    @Suppress("UNCHECKED_CAST")
-    private suspend fun loadTracksFromDao(): List<Any>? {
-        return try {
-            val db = resolveAppDatabaseInstance() ?: run {
-                logDebug("loadTracksFromDao(): AppDatabase instance not available")
-                return null
-            }
-            logDebug("loadTracksFromDao(): db instance class=${db.javaClass.name}")
-
-            val trackDaoMethod = rfTrackDaoMethod ?: resolveTrackDaoMethod(db)?.also {
-                rfTrackDaoMethod = it
-                logDebug("loadTracksFromDao(): trackDao method cached from ${db.javaClass.name}")
-            } ?: run {
-                logDebug("loadTracksFromDao(): trackDao method not found; db=${db.javaClass.name}")
-                return null
-            }
-            val trackDao = trackDaoMethod.invoke(db) ?: run {
-                logDebug("loadTracksFromDao(): trackDao invoke returned null")
-                return null
-            }
-            logDebug("loadTracksFromDao(): trackDao class=${trackDao.javaClass.name}")
-
-            val getAllFlowMethod = rfGetAllFlowMethod ?: resolveTrackListFlowMethod(trackDao)?.also {
-                rfGetAllFlowMethod = it
-                logDebug("loadTracksFromDao(): getAllFlow method cached from ${trackDao.javaClass.name}")
-            } ?: run {
-                logDebug("loadTracksFromDao(): getAllFlow method not found")
-                return null
-            }
-            val flow = getAllFlowMethod.invoke(trackDao) as? Flow<*> ?: run {
-                logDebug("loadTracksFromDao(): getAllFlow did not return Flow")
-                return null
-            }
-
-            val list = (flow.first() as? List<*>)?.filterIsInstance<Any>()
-            logDebug("loadTracksFromDao(): flow.first returned ${list?.size ?: -1} tracks")
-            list
-        } catch (t: Throwable) {
-            logThrowable("loadTracksFromDao(): failure", t)
-            null
-        }
-    }
-
-    private fun refreshTrackCache(reason: String, tracks: List<Any>? = null) {
+    private fun refreshTrackCache(reason: String, tracks: List<MediaItem>? = null) {
         if (tracks != null) {
             try {
                 cachedTrackMap = loadTrackMapFromTracks(tracks)
@@ -549,7 +495,7 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         val scope = pluginScope ?: return
         scope.launch {
             try {
-                val sourceTracks = loadTracksFromDao()
+                val sourceTracks = getAllTracks()
                 if (sourceTracks.isNullOrEmpty()) {
                     logDebug("refreshTrackCache($reason): no tracks loaded")
                     return@launch
@@ -562,15 +508,15 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         }
     }
 
-    private fun getCachedTrackMap(): Map<String, Any>? {
+    private fun getCachedTrackMap(): Map<String, MediaItem>? {
         val map = cachedTrackMap
         if (map != null) return map
         return null
     }
 
-    private fun loadTrackMapFromTracks(tracks: List<Any>): Map<String, Any> {
+    private fun loadTrackMapFromTracks(tracks: List<MediaItem>): Map<String, MediaItem> {
         return tracks.mapNotNull { track ->
-            val id = trackValue(track, "getId")?.toString().orEmpty()
+            val id = track.id
             if (id.isBlank()) null else id to track
         }.toMap()
     }
@@ -582,13 +528,13 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         ERROR
     }
 
-    private fun seedFirstTrack(track: Any, checkExisting: Boolean): SeedResult {
+    private fun seedFirstTrack(track: MediaItem, checkExisting: Boolean): SeedResult {
         return try {
-            val trackId = trackValue(track, "getId")?.toString()?.takeIf { it.isNotBlank() }
+            val trackId = track.id.takeIf { it.isNotBlank() }
                 ?: throw IllegalStateException("Track id missing")
-            val title = trackValue(track, "getTitle")?.toString().orEmpty()
-            val artist = trackValue(track, "getArtist")?.toString().orEmpty()
-            val album = trackValue(track, "getAlbum")?.toString().orEmpty()
+            val title = track.title
+            val artist = track.artist
+            val album = track.album
             val contentHash = buildTrackContentHash(track)
             val existingById = embeddingDb.getById(trackId)
             if (existingById != null) {
@@ -632,12 +578,12 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         }
     }
 
-    private fun buildTrackSourceText(track: Any): String {
-        val title = trackValue(track, "getTitle")?.toString().orEmpty()
-        val artist = trackValue(track, "getArtist")?.toString().orEmpty()
-        val album = trackValue(track, "getAlbum")?.toString().orEmpty()
-        val year = trackValue(track, "getYear")?.toString().orEmpty()
-        val lyrics = normalizeLyrics(readTrackLyrics(trackValue(track, "getPath")?.toString().orEmpty()).orEmpty())
+    private fun buildTrackSourceText(track: MediaItem): String {
+        val title = track.title
+        val artist = track.artist
+        val album = track.album
+        val year = track.year.toString()
+        val lyrics = normalizeLyrics(readTrackLyrics(track.path).orEmpty())
 
         logDebug("buildTrackSourceText(): lyricsIncluded=${lyrics.isNotBlank()} lyricsLength=${lyrics.length}")
 
@@ -653,8 +599,8 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         }.trimEnd()
     }
 
-    private fun buildTrackContentHash(track: Any): String {
-        val path = trackValue(track, "getPath")?.toString().orEmpty()
+    private fun buildTrackContentHash(track: MediaItem): String {
+        val path = track.path
         if (path.isBlank()) return ""
         val normalizedPath = fileUriToOsPath(path)
         return try {
@@ -692,14 +638,14 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     /**
      * Constructs a PiscesMediaItem via the cached constructor.
      */
-    private fun buildPlaybackItem(track: Any): Any? {
+    private fun buildPlaybackItem(track: MediaItem): Any? {
         return try {
-            val id = trackValue(track, "getId")?.toString().orEmpty()
-            val title = trackValue(track, "getTitle")?.toString().orEmpty()
-            val artist = trackValue(track, "getArtist")?.toString().orEmpty()
-            val album = trackValue(track, "getAlbum")?.toString().orEmpty()
-            val albumArtist = trackValue(track, "getAlbumArtist")?.toString().orEmpty()
-            val rawPath = trackValue(track, "getPath")?.toString().orEmpty()
+            val id = track.id
+            val title = track.title
+            val artist = track.artist
+            val album = track.album
+            val albumArtist = track.albumArtist
+            val rawPath = track.path
             // SPW stores paths as file:/// URIs, but PiscesMediaItem expects OS paths.
             // Convert: "file:///D:/Music/x.flac" → "D:\Music\x.flac" (Windows)
             val path = fileUriToOsPath(rawPath)
@@ -858,80 +804,87 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
     }
 
     /**
-     * Reads a getter method result from a Track instance.
-     * Caches the resolved Method on first call for each getter name.
-     */
-    private fun trackValue(track: Any, getterName: String): Any? {
-        return try {
-            val method = when (getterName) {
-                "getId"         -> rfTrackGetId         ?: track.javaClass.getMethod(getterName).also {
-                    rfTrackGetId = it
-                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
-                }
-                "getTitle"      -> rfTrackGetTitle      ?: track.javaClass.getMethod(getterName).also {
-                    rfTrackGetTitle = it
-                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
-                }
-                "getArtist"     -> rfTrackGetArtist     ?: track.javaClass.getMethod(getterName).also {
-                    rfTrackGetArtist = it
-                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
-                }
-                "getAlbum"      -> rfTrackGetAlbum      ?: track.javaClass.getMethod(getterName).also {
-                    rfTrackGetAlbum = it
-                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
-                }
-                "getAlbumArtist"-> rfTrackGetAlbumArtist?: track.javaClass.getMethod(getterName).also {
-                    rfTrackGetAlbumArtist = it
-                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
-                }
-                "getYear"       -> rfTrackGetYear       ?: track.javaClass.getMethod(getterName).also {
-                    rfTrackGetYear = it
-                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
-                }
-                "getPath"       -> rfTrackGetPath       ?: track.javaClass.getMethod(getterName).also {
-                    rfTrackGetPath = it
-                    logDebug("trackValue(): cached getter $getterName on ${track.javaClass.name}")
-                }
-                else            -> track.javaClass.getMethod(getterName)
-            }
-            method.invoke(track)
-        } catch (t: Throwable) {
-            logThrowable("trackValue(): $getterName failed", t)
-            null
-        }
-    }
-
-    /**
-     * Reads the search box text from the active Compose window via a 9-step field chain.
-     * Each field is resolved lazily on first call and cached for all subsequent calls.
+     * Reads the search box text from the active Compose window.
+     *
+     * SPW 1.19 uses the new Compose text-input service for TextFieldState. The
+     * names below are the actual names emitted by the binary, not JADX's Kotlin
+     * metadata aliases. This intentionally targets only the 1.19.0 service.
      */
     private fun getSearchText(window: java.awt.Window): String? {
-        val panel     = cachedGetField(window,    "\u0528", "ComposeWindow.Ԩ",        { rfCwPanel },      { rfCwPanel = it })      ?: return null
-        val container = cachedGetField(panel,     "\u052A", "ComposeWindowPanel.Ԫ",   { rfCwpContainer }, { rfCwpContainer = it }) ?: return null
-        val mediator  = cachedGetField(container, "\u058F", "ComposeContainer.֏",     { rfCcMediator },   { rfCcMediator = it })   ?: return null
-        val sceneLazy = cachedGetField(mediator,  "\u0794", "ComposeSceneMediator.ޔ", { rfCsmSceneLazy }, { rfCsmSceneLazy = it }) ?: return null
-        val scene     = resolveLazy(sceneLazy) ?: return null
-        val step5     = cachedGetField(scene,     "\u037F", "ComposeScene.Ϳ",         { rfCsStep5 },      { rfCsStep5 = it })      ?: return null
-        val step6     = cachedGetField(step5,     "\u052C", "DepthComposedScene.Ԭ",   { rfDcsStep6 },     { rfDcsStep6 = it })     ?: return null
-        val step7     = cachedGetField(step6,     "\u0791", "InnerMediator.ޑ",        { rfImStep7 },      { rfImStep7 = it })      ?: return null
-        val c2294     = cachedGetField(step7,     "\u0528", "PlatformContext.Ԩ",       { rfPcC2294 },      { rfPcC2294 = it })      ?: return null
-        val textState = cachedGetField(c2294,     "\u0528", "TextInputSession.Ԩ",     { rfTisTextState }, { rfTisTextState = it }) ?: return null
-        return readComposeText(textState)
+        val panel = cachedGetField(window, "composePanel", "ComposeWindow.composePanel", { rfCwPanel }, { rfCwPanel = it })
+            ?: return null
+        val container = cachedGetField(panel, "_composeContainer", "ComposeWindowPanel._composeContainer", { rfCwpContainer }, { rfCwpContainer = it })
+            ?: return null
+        val mediator = cachedGetField(container, "mediator", "ComposeContainer.mediator", { rfCcMediator }, { rfCcMediator = it })
+            ?: return null
+
+        return readNewTextInputState(mediator)
     }
 
     /**
-     * Current Compose's TextEditorState implementation is a CharSequence but does not
-     * override Object.toString(). Copy its characters explicitly; otherwise toString()
-     * yields an internal class name such as androidx.compose.ui.ռ$Ԩ@... .
+     * Reads Compose 1.19's active TextEditorState through the actual runtime
+     * chain used by DesktopTextInputService2. This is the path used by SPW's
+     * ScreenSearchBar(TextFieldState).
      */
-    private fun readComposeText(textState: Any): String? {
-        val value = textState as? CharSequence ?: run {
-            logDebug("readComposeText(): expected CharSequence, actual=${textState.javaClass.name}")
-            return null
+    private fun readNewTextInputState(mediator: Any): String? {
+        return try {
+            val textInputService2 = if (cachedTextInputMediator === mediator) {
+                cachedTextInputService2
+            } else {
+                val getTextInputService2 = rfCsmGetTextInputService2 ?: mediator.javaClass
+                    .getDeclaredMethod("getTextInputService2")
+                    .apply { isAccessible = true }
+                    .also { rfCsmGetTextInputService2 = it }
+                getTextInputService2.invoke(mediator).also {
+                    cachedTextInputMediator = mediator
+                    cachedTextInputService2 = it
+                }
+            }
+                ?: run {
+                    logDebug("readNewTextInputState(): ComposeSceneMediator.getTextInputService2 returned null")
+                    return null
+                }
+            val inputMethodSession = cachedGetField(
+                textInputService2,
+                "inputMethodSession",
+                "DesktopTextInputService2.inputMethodSession",
+                { rfDtis2InputMethodSession },
+                { rfDtis2InputMethodSession = it }
+            ) ?: run {
+                logDebug("readNewTextInputState(): inputMethodSession is null")
+                return null
+            }
+            val request = cachedGetField(
+                inputMethodSession,
+                "request",
+                "InputMethodSession.request",
+                { rfInputSessionRequest },
+                { rfInputSessionRequest = it }
+            ) ?: run {
+                logDebug("readNewTextInputState(): request is null")
+                return null
+            }
+            val getState = rfRequestGetState ?: request.javaClass
+                .getMethod("getState")
+                .apply { isAccessible = true }
+                .also { rfRequestGetState = it }
+            val state = getState.invoke(request) ?: run {
+                logDebug("readNewTextInputState(): PlatformTextInputMethodRequest.getState returned null")
+                return null
+            }
+            val getText = rfTextEditorStateGetText ?: state.javaClass
+                .getMethod("getText")
+                .apply { isAccessible = true }
+                .also { rfTextEditorStateGetText = it }
+            val text = (getText.invoke(state) as? String)?.takeIf { it.isNotBlank() }
+            logDebug(
+                "readNewTextInputState(): stateClass=${state.javaClass.name}, textLength=${text?.length ?: 0}"
+            )
+            text
+        } catch (t: Throwable) {
+            logThrowable("readNewTextInputState(): failed", t)
+            null
         }
-        val text = StringBuilder(value.length).append(value).toString()
-        logDebug("readComposeText(): stateClass=${textState.javaClass.name}, length=${text.length}")
-        return text
     }
 
     /**
@@ -949,7 +902,9 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
         if (cached != null) {
             return try {
                 val value = cached.get(obj)
-                logDebug("cachedGetField(): $label cache hit in ${cached.declaringClass.name}, valueClass=${value?.javaClass?.name}")
+                if (debugLogEnabled) {
+                    logDebug("cachedGetField(): $label cache hit in ${cached.declaringClass.name}, valueClass=${value?.javaClass?.name}")
+                }
                 value
             } catch (t: Throwable) {
                 logThrowable("cachedGetField(): $label get failed", t)
@@ -964,7 +919,9 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 field.isAccessible = true
                 val value = field.get(obj)
                 setCache(field)
-                logDebug("cachedGetField(): $label cached from ${c.name}, valueClass=${value?.javaClass?.name}")
+                if (debugLogEnabled) {
+                    logDebug("cachedGetField(): $label cached from ${c.name}, valueClass=${value?.javaClass?.name}")
+                }
                 return value
             } catch (_: NoSuchFieldException) {
                 c = c.superclass
@@ -973,211 +930,10 @@ class MainPlugin(pluginContext: PluginContext) : SpwPlugin(pluginContext) {
                 return null
             }
         }
-        logDebug("cachedGetField(): $label not found from ${obj.javaClass.name}")
+        if (debugLogEnabled) {
+            logDebug("cachedGetField(): $label not found from ${obj.javaClass.name}")
+        }
         return null
-    }
-
-    /**
-     * Non-caching field lookup; used by resolveLazy and as a fallback.
-     */
-    private fun getField(obj: Any, name: String, label: String): Any? {
-        var c: Class<*>? = obj.javaClass
-        while (c != null) {
-            try {
-                val field = c.getDeclaredField(name)
-                field.isAccessible = true
-                val value = field.get(obj)
-                logDebug("getField(): $label hit in ${c.name}, valueClass=${value?.javaClass?.name}")
-                return value
-            } catch (_: NoSuchFieldException) {
-                c = c.superclass
-            } catch (t: Throwable) {
-                logThrowable("getField(): $label failed in ${c.name}", t)
-                return null
-            }
-        }
-        logDebug("getField(): $label not found from ${obj.javaClass.name}")
-        return null
-    }
-
-    private fun resolveAppDatabaseInstance(): Any? {
-        val appDbClass = runCatching {
-            Class.forName("com.xuncorp.voxzen.data.AppDatabase")
-        }.getOrElse { t ->
-            logThrowable("resolveAppDatabaseInstance(): load AppDatabase class failed", t)
-            return null
-        }
-
-        // Current SPW binary: JADX's Kotlin-metadata display name is VoxzenDatabase,
-        // while reflection must use its raw class/method names: ԫ.Ϳ().
-        runCatching {
-            val holderClass = Class.forName("com.xuncorp.voxzen.data.ԫ")
-            val getInstance = holderClass.getDeclaredMethod("Ϳ").apply { isAccessible = true }
-            val value = getInstance.invoke(null)
-            logDebug(
-                "resolveAppDatabaseInstance(): current raw holder ${holderClass.name}.${getInstance.name}() -> ${value?.javaClass?.name}"
-            )
-            if (value != null && appDbClass.isAssignableFrom(value.javaClass)) return value
-        }.onFailure { t ->
-            logThrowable("resolveAppDatabaseInstance(): current raw holder failed", t)
-        }
-
-        runCatching {
-            val field = appDbClass.getDeclaredField("ށ").apply { isAccessible = true }
-            val value = field.get(null)
-            logDebug("resolveAppDatabaseInstance(): direct field ${field.name} -> ${value?.javaClass?.name}")
-            if (value != null) return value
-        }.onFailure { t ->
-            logThrowable("resolveAppDatabaseInstance(): direct field ށ failed", t)
-        }
-
-        logDeclaredMethods(appDbClass, "resolveAppDatabaseInstance(): AppDatabase class")
-
-        for (field in appDbClass.declaredFields) {
-            runCatching {
-                field.isAccessible = true
-                val value = field.get(null)
-                logDebug("resolveAppDatabaseInstance(): field ${field.name} type=${field.type.name} -> ${value?.javaClass?.name}")
-
-                if (value == null) return@runCatching
-
-                val valueClass = value.javaClass
-                if (valueClass.name == "com.xuncorp.voxzen.data.AppDatabase" || valueClass.superclass?.name == "com.xuncorp.voxzen.data.AppDatabase" || valueClass.name.endsWith("AppDatabase_Impl")) {
-                    logDebug("resolveAppDatabaseInstance(): matched database instance from field ${field.name}")
-                    return value
-                }
-
-                val holderGetter = valueClass.declaredMethods.firstOrNull {
-                    it.parameterCount == 0 && it.returnType.name == "com.xuncorp.voxzen.data.AppDatabase"
-                }
-                if (holderGetter != null) {
-                    logDeclaredMethods(valueClass, "resolveAppDatabaseInstance(): holder ${valueClass.name}")
-                    holderGetter.isAccessible = true
-                    val db = holderGetter.invoke(value)
-                    logDebug("resolveAppDatabaseInstance(): ${valueClass.name}.${holderGetter.name}() -> ${db?.javaClass?.name}")
-                    if (db != null) return db
-                }
-            }.onFailure { t ->
-                logThrowable("resolveAppDatabaseInstance(): field ${field.name} read failed", t)
-            }
-        }
-
-        logDebug("resolveAppDatabaseInstance(): no database instance found")
-        return null
-    }
-
-    private fun resolveTrackDaoMethod(db: Any): java.lang.reflect.Method? {
-        val clazz = db.javaClass
-        logDebug(
-            "resolveTrackDaoMethod(): scanning ${clazz.name}, super=${clazz.superclass?.name}, interfaces=${clazz.interfaces.joinToString { it.name }}"
-        )
-
-        runCatching {
-            clazz.getDeclaredMethod("Ϳ").apply { isAccessible = true }
-        }.onSuccess { method ->
-            logDebug("resolveTrackDaoMethod(): direct hit ${clazz.name}.${method.name}/0 -> ${method.returnType.name}")
-            return method
-        }.onFailure { t ->
-            logThrowable("resolveTrackDaoMethod(): direct method Ϳ failed on ${clazz.name}", t)
-        }
-
-        var c: Class<*>? = clazz
-        while (c != null) {
-            c.declaredMethods.forEach { method ->
-                if (method.parameterCount == 0) {
-                    logDebug(
-                        "resolveTrackDaoMethod(): candidate ${c.name}.${method.name}/0 -> ${method.returnType.name}"
-                    )
-                }
-                if (method.parameterCount == 0 && method.name == "Ϳ") {
-                    method.isAccessible = true
-                    logDebug("resolveTrackDaoMethod(): matched ${c.name}.${method.name}/0")
-                    return method
-                }
-            }
-            c = c.superclass
-        }
-        logDebug("resolveTrackDaoMethod(): no zero-arg method Ϳ found on ${clazz.name}")
-        return null
-    }
-
-    private fun resolveTrackListFlowMethod(trackDao: Any): java.lang.reflect.Method? {
-        val clazz = trackDao.javaClass
-        logDebug(
-            "resolveTrackListFlowMethod(): scanning ${clazz.name}, super=${clazz.superclass?.name}, interfaces=${clazz.interfaces.joinToString { it.name }}"
-        )
-
-        runCatching {
-            clazz.getDeclaredMethod("Ԩ").apply { isAccessible = true }
-        }.onSuccess { method ->
-            logDebug("resolveTrackListFlowMethod(): direct hit ${clazz.name}.${method.name}/0 -> ${method.returnType.name}")
-            return method
-        }.onFailure { t ->
-            logThrowable("resolveTrackListFlowMethod(): direct method Ԩ failed on ${clazz.name}", t)
-        }
-
-        var c: Class<*>? = clazz
-        while (c != null) {
-            c.declaredMethods.forEach { method ->
-                if (method.parameterCount == 0) {
-                    logDebug(
-                        "resolveTrackListFlowMethod(): candidate ${c.name}.${method.name}/0 -> ${method.returnType.name}"
-                    )
-                }
-                if (method.parameterCount == 0 && method.name == "Ԩ") {
-                    method.isAccessible = true
-                    logDebug("resolveTrackListFlowMethod(): matched ${c.name}.${method.name}/0")
-                    return method
-                }
-            }
-            c = c.superclass
-        }
-        logDebug("resolveTrackListFlowMethod(): no zero-arg method Ԩ found on ${clazz.name}")
-        return null
-    }
-
-    private fun logDeclaredMethods(clazz: Class<*>, label: String) {
-        try {
-            val methods = clazz.declaredMethods
-            logDebug("$label: declaredMethods=${methods.size}")
-            methods.forEach { method ->
-                logDebug(
-                    "$label: method ${method.name}/${method.parameterCount} -> ${method.returnType.name} params=${method.parameterTypes.joinToString { it.name }}"
-                )
-            }
-        } catch (t: Throwable) {
-            logThrowable("$label: failed to enumerate declared methods", t)
-        }
-    }
-
-    private fun findMethod(clazz: Class<*>, name: String, paramCount: Int): java.lang.reflect.Method? {
-        var c: Class<*>? = clazz
-        while (c != null) {
-            c.declaredMethods
-                .firstOrNull { it.name == name && it.parameterCount == paramCount }
-                ?.also {
-                    it.isAccessible = true
-                    logDebug("findMethod(): found $name/$paramCount in ${c.name}")
-                }
-                ?.let { return it }
-            c = c.superclass
-        }
-        logDebug("findMethod(): missing $name/$paramCount from ${clazz.name}")
-        return null
-    }
-
-    private fun resolveLazy(obj: Any): Any? = try {
-        val method = obj.javaClass.getDeclaredMethod("getValue").apply {
-            isAccessible = true
-        }
-        val value = method.invoke(obj)
-        logDebug("resolveLazy(): getValue success, valueClass=${value?.javaClass?.name}")
-        value
-    } catch (t: Throwable) {
-        logThrowable("resolveLazy(): getValue failed", t)
-        val fallback = getField(obj, "_value", "Lazy._value") ?: getField(obj, "value", "Lazy.value")
-        logDebug("resolveLazy(): fallback valueClass=${fallback?.javaClass?.name}")
-        fallback
     }
 
     private fun logThrowable(message: String, t: Throwable) {

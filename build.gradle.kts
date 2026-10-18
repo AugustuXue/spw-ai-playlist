@@ -1,33 +1,33 @@
-﻿import org.gradle.api.file.DuplicatesStrategy
+import com.xuncorp.spw.workshop.gradle.PluginPermission
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("java-library")
-    id("org.jetbrains.kotlin.jvm") version "2.3.0"
+    id("org.jetbrains.kotlin.jvm") version "2.4.20"
+    id("org.jetbrains.kotlin.kapt") version "2.4.20"
+    id("com.xuncorp.spw.workshop") version "0.1.0-dev22"
 }
 
 group = "com.gg.spwaiplaylist"
-version = "1.0.2"
+version = "1.1.0"
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
 }
 
 kotlin {
+    jvmToolchain(25)
     compilerOptions {
-        jvmTarget = JvmTarget.JVM_21
+        jvmTarget = JvmTarget.JVM_25
         freeCompilerArgs.add("-Xjvm-default=all")
     }
 }
 
-repositories {
-    mavenCentral()
-}
-
 dependencies {
     compileOnly(kotlin("stdlib"))
-    compileOnly(files("libs/api-0.1.0-dev20.jar"))
+    compileOnly("com.github.Moriafly:spw-workshop-api:0.1.0-dev22")
+    kapt("com.github.Moriafly:spw-workshop-api:0.1.0-dev22")
     compileOnly("org.pf4j:pf4j:3.12.0")
     compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.xerial:sqlite-jdbc:3.47.1.0")
@@ -35,65 +35,23 @@ dependencies {
     implementation("org.json:json:20240303")
 }
 
-val pluginClass = "com.gg.spwaiplaylist.MainPlugin"
-val pluginId = "com.gg.spwaiplaylist"
-val pluginName = "SPW AI Playlist"
-val pluginDescription = "An AI-powered playlist plugin for SPW."
-val pluginVersion = "1.0.2"
-val pluginProvider = "Augustu"
+spmod {
+    PluginClass = "com.gg.spwaiplaylist.MainPlugin"
+    PluginId = "com.gg.spwaiplaylist"
+    PluginName = "SPW AI Playlist"
+    PluginDescription = "An AI-powered playlist plugin for SPW."
+    PluginVersion = project.version.toString()
+    PluginProvider = "Augustu"
+    PluginHasConfig = true
+    PluginPermissions = listOf(PluginPermission.LIBRARY_READ)
+    PluginOpenSourceUrl = "https://github.com/AugustuXue/spw-ai-playlist"
+}
+
 val workshopPluginsDir = file(System.getenv("APPDATA") + "/Salt Player for Windows/workshop/plugins/")
-val pluginInstallDir = workshopPluginsDir.resolve("SPW-AI-Playlist-$pluginVersion")
-
-fun jarContents() = zipTree(tasks.named<Jar>("jar").get().archiveFile.get())
-
-tasks.named<Jar>("jar") {
-    manifest {
-        attributes(
-            "Plugin-Class" to pluginClass,
-            "Plugin-Id" to pluginId,
-            "Plugin-Name" to pluginName,
-            "Plugin-Description" to pluginDescription,
-            "Plugin-Version" to pluginVersion,
-            "Plugin-Provider" to pluginProvider,
-            "Plugin-Open-Source-Url" to "https://github.com/AugustuXue/spw-ai-playlist",
-            "Plugin-Has-Config" to "true",
-        )
-    }
-}
-
-tasks.named<ProcessResources>("processResources") {
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-}
-
-tasks.register<Zip>("pluginZip") {
-    destinationDirectory.set(workshopPluginsDir)
-    archiveFileName.set("SPW-AI-Playlist-$pluginVersion.zip")
-    archiveExtension.set("zip")
-
-    dependsOn(tasks.named("jar"), configurations.runtimeClasspath)
-
-    from({ jarContents() }) {
-        into("classes")
-    }
-    from(configurations.runtimeClasspath) {
-        into("lib")
-        include("*.jar")
-    }
-}
+val pluginInstallDir = workshopPluginsDir.resolve("SPW-AI-Playlist-${project.version}")
 
 tasks.register<Sync>("deployPlugin") {
+    dependsOn(tasks.named("plugin"))
     into(pluginInstallDir)
-    dependsOn(tasks.named("jar"), configurations.runtimeClasspath)
-
-    from({ jarContents() }) {
-        into("classes")
-    }
-    from(configurations.runtimeClasspath) {
-        into("lib")
-        include("*.jar")
-    }
-}
-
-tasks.register("plugin") {
-    dependsOn("pluginZip", "deployPlugin")
+    from({ zipTree(tasks.named<Zip>("plugin").get().archiveFile.get()) })
 }

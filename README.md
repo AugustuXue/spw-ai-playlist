@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/0a49b46e-198d-425a-80c4-7182a1714ba7
 
 - 开源地址：https://github.com/AugustuXue/spw-ai-playlist
 - 下载地址：https://github.com/AugustuXue/spw-ai-playlist/releases
+- Steam 创意工坊：https://steamcommunity.com/sharedfiles/filedetails/?id=3821976568
 
 ## 功能
 
